@@ -12,9 +12,7 @@ Supported out of the box:
 * mp3
 * wav
 * ogg (vorbis)
-
-May (on future version) or not supported:
-* ogg (opus)
+* ogg (opus) (unstable)
 
 ## Example
 ```rs

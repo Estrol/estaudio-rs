@@ -340,7 +340,7 @@ pub fn read_ogg_data_file(file_path: &str) -> Result<Box<ma_audio_buffer>, Strin
 
     match _type {
         Some(OggType::Opus) => {
-            return Err("Opus format is not supported yet".to_string());
+            return read_ogg_opus(reader);
         }
         Some(OggType::Vorbis) => {
             let reader = OggStreamReader::new(reader).map_err(|e| e.to_string())?;
@@ -367,7 +367,7 @@ pub fn read_ogg_data_buffer(buffer: &[u8]) -> Result<Box<ma_audio_buffer>, Strin
 
     match _type {
         Some(OggType::Opus) => {
-            return Err("Opus format is not supported yet".to_string());
+            return read_ogg_opus(reader);
         }
         Some(OggType::Vorbis) => {
             let reader = OggStreamReader::new(reader).map_err(|e| e.to_string())?;
@@ -422,7 +422,47 @@ fn read_ogg_vorbis<T: Read + Seek>(
     }
 }
 
-// fn read_ogg_opus()
+fn read_ogg_opus<T: Seek + Read>(data: T) -> Result<Box<ma_audio_buffer>, String> {
+    let decoded = ogg_opus::decode::<T, 48000>(data)
+        .map_err(|e| format!("Failed to decode Opus data: {}", e))?;
+
+    let mut pcm_f32 = Vec::new();
+    for frame in decoded.0.iter() {
+        pcm_f32.push(*frame as f32 / i16::MAX as f32);
+    }
+
+    let channel = decoded.1.channels;
+    let sample_rate = 48000;
+
+    let pcm_length = pcm_f32.len() / channel as usize;
+    let mut audio_buffer = Box::<ma_audio_buffer>::new_uninit();
+
+    unsafe {
+        let mut config = ma_audio_buffer_config_init(
+            ma_format_f32,
+            channel as u32,
+            pcm_length as u64,
+            pcm_f32.as_ptr() as *const c_void,
+            std::ptr::null(),
+        );
+
+        config.sampleRate = sample_rate;
+
+        let result =
+            ma_audio_buffer_init_copy(&config, audio_buffer.as_mut_ptr() as *mut ma_audio_buffer);
+
+        if result != MA_SUCCESS {
+            return Err(format!(
+                "Failed to initialize audio buffer: {}",
+                utils::ma_to_string_result(result)
+            ));
+        }
+
+        let audio_buffer = audio_buffer.assume_init();
+
+        Ok(audio_buffer)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OggType {
