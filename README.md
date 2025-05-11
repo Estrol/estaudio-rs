@@ -40,3 +40,5 @@ fn main() {
 
 ## License
 MIT or Apache 2.0
+
+Excepts on each file in the `assets` folder has its own license.
