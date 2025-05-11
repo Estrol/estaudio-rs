@@ -128,6 +128,8 @@ impl AudioDeviceInner {
         let required_frame_count = required_frame_count.unwrap();
         let channel_count = self.device.playback.channels as usize;
 
+        utils::array_fast_set_value_f32(&mut self.resampler_buffer, 0.0);
+
         if self.fx.is_some() {
             let fx = self.fx.as_mut().unwrap();
 
@@ -162,11 +164,9 @@ impl AudioDeviceInner {
                         .unwrap_or(0);
 
                     if frames_read > 0 {
-                        utils::array_fast_copy_f32(
+                        utils::array_fast_add_value_f32(
                             &self.buffer,
                             &mut self.resampler_buffer,
-                            0,
-                            0,
                             (frames_read as usize * channel_count) as usize,
                         );
                     }
@@ -190,11 +190,9 @@ impl AudioDeviceInner {
                         .unwrap_or(0);
 
                     if frames_read > 0 {
-                        utils::array_fast_copy_f32(
+                        utils::array_fast_add_value_f32(
                             &self.buffer,
                             &mut self.resampler_buffer,
-                            0,
-                            0,
                             (frames_read as usize * channel_count) as usize,
                         );
                     }
@@ -250,11 +248,9 @@ impl AudioDeviceInner {
                         .unwrap_or(0);
 
                     if frames_read > 0 {
-                        utils::array_fast_copy_f32(
+                        utils::array_fast_add_value_f32(
                             &self.buffer,
                             &mut self.resampler_buffer,
-                            0,
-                            0,
                             (frames_read as usize * channel_count) as usize,
                         );
                     }
@@ -276,11 +272,9 @@ impl AudioDeviceInner {
                         .unwrap_or(0);
 
                     if frames_read > 0 {
-                        utils::array_fast_copy_f32(
+                        utils::array_fast_add_value_f32(
                             &self.buffer,
                             &mut self.resampler_buffer,
-                            0,
-                            0,
                             (frames_read as usize * channel_count) as usize,
                         );
                     }
