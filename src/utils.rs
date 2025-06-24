@@ -214,6 +214,7 @@ pub enum TweenType {
     Circular,
 }
 
+#[allow(dead_code)]
 pub fn tween(tween_type: TweenType, t: f32) -> f32 {
     match tween_type {
         TweenType::Linear => t,
@@ -315,11 +316,18 @@ pub trait MutexPoison<T> {
     fn try_lock_poison(&self) -> Option<MutexGuard<'_, T>>;
 }
 
+/// A struct representing a PCM index.
+/// This struct is used to represent a sample index in PCM audio data.
+/// It provides methods to create a new index, convert between seconds and milliseconds,
+/// and convert to and from a u64 representation.
 pub struct PCMIndex {
     pub index: usize,
 }
 
 impl PCMIndex {
+    /// Creates a new PCMIndex with the given index.
+    /// If the index is 0, it returns None.
+    /// Otherwise, it returns Some(PCMIndex).
     pub fn new(index: usize) -> Option<Self> {
         if index > 0 {
             Some(PCMIndex { index })
@@ -328,20 +336,28 @@ impl PCMIndex {
         }
     }
 
+    /// Creates a new PCMIndex with the given seconds and sample rate.
+    /// It calculates the index based on the sample rate and returns Some(PCMIndex).
     pub fn from_secs(seconds: f32, sample_rate: u32) -> Option<Self> {
         let index = (seconds * sample_rate as f32) as usize;
         Self::new(index)
     }
 
+    /// Creates a new PCMIndex with the given milliseconds and sample rate.
+    /// It calculates the index based on the sample rate and returns Some(PCMIndex).
     pub fn from_millis(milliseconds: f32, sample_rate: u32) -> Option<Self> {
         let index = (milliseconds * sample_rate as f32 / 1000.0) as usize;
         Self::new(index)
     }
 
+    /// Returns the index as a seconds value.
+    /// It divides the index by the sample rate to get the seconds.
     pub fn to_secs(&self, sample_rate: u32) -> f32 {
         self.index as f32 / sample_rate as f32
     }
 
+    /// Returns the index as a milliseconds value.
+    /// It multiplies the index by 1000 and divides by the sample rate to get milliseconds.
     pub fn to_millis(&self, sample_rate: u32) -> f32 {
         self.index as f32 * 1000.0 / sample_rate as f32
     }

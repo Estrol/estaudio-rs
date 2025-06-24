@@ -38,26 +38,6 @@ dependencies = [
 
 [[package]]
 name = "bindgen"
-version = "0.69.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "271383c67ccabffb7381723dea0672a673f292304fcb45c01cc648c7a8d58088"
-dependencies = [
- "bitflags",
- "cexpr",
- "clang-sys",
- "itertools",
- "lazy_static",
- "lazycell",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash",
- "shlex",
- "syn",
-]
-
-[[package]]
-name = "bindgen"
 version = "0.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
@@ -71,7 +51,25 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash",
+ "rustc-hash 1.1.0",
+ "shlex",
+ "syn",
+]
+
+[[package]]
+name = "bindgen"
+version = "0.72.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f72209734318d0b619a5e0f5129918b848c416e122a3c4ce054e03cb87b726f"
+dependencies = [
+ "bitflags",
+ "cexpr",
+ "clang-sys",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 2.1.1",
  "shlex",
  "syn",
 ]
@@ -249,15 +247,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
-name = "estaudioengine"
+name = "est-audio"
 version = "0.1.0"
 dependencies = [
  "as-any",
+ "est-audio-fork-ep-miniaudio-sys",
  "lewton",
  "ogg 0.9.2",
  "ogg-opus",
- "om-fork-ep-miniaudio-sys",
  "signalsmith-stretch",
+]
+
+[[package]]
+name = "est-audio-fork-ep-miniaudio-sys"
+version = "2.6.2"
+source = "git+https://github.com/Estrol/miniaudio-rs#0e5b014075727591dba6f28585f1c17b7e807192"
+dependencies = [
+ "bindgen 0.72.0",
+ "bitflags",
+ "cc",
+ "libc",
 ]
 
 [[package]]
@@ -285,18 +294,6 @@ checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
 dependencies = [
  "either",
 ]
-
-[[package]]
-name = "lazy_static"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-
-[[package]]
-name = "lazycell"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
 name = "lewton"
@@ -382,17 +379,6 @@ dependencies = [
  "ogg 0.8.0",
  "rand",
  "thiserror",
-]
-
-[[package]]
-name = "om-fork-ep-miniaudio-sys"
-version = "2.6.1"
-source = "git+https://github.com/Estrol/miniaudio-rs#b7cd2dfb5829e6c3208ee8d47684ad17f92e6838"
-dependencies = [
- "bindgen 0.69.5",
- "bitflags",
- "cc",
- "libc",
 ]
 
 [[package]]
@@ -502,6 +488,12 @@ name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
 
 [[package]]
 name = "shlex"

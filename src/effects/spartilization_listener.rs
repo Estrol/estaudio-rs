@@ -1,11 +1,40 @@
 use miniaudio_sys::*;
 
+#[derive(Debug, Clone)]
+pub enum AudioSpatializationListenerError {
+    InitializationFailed(i32), // Holds the error code from miniaudio
+    InvalidChannels(u32),      // Holds the invalid channel count
+    NotInitialized,            // Indicates that the spatializer was not initialized properly
+}
+
+impl std::fmt::Display for AudioSpatializationListenerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioSpatializationListenerError::InitializationFailed(code) => {
+                write!(f, "Initialization failed with error code: {}", code)
+            }
+            AudioSpatializationListenerError::InvalidChannels(channels) => {
+                write!(f, "Invalid number of channels: {}", channels)
+            }
+            AudioSpatializationListenerError::NotInitialized => {
+                write!(f, "Spatializer listener not initialized")
+            }
+        }
+    }
+}
+
 pub struct AudioSpatializationListener {
     pub spatialization: Box<ma_spatializer_listener>,
 }
 
 impl AudioSpatializationListener {
-    pub fn new(channels_out: u32) -> Result<Self, String> {
+    pub fn new(channels_out: u32) -> Result<Self, AudioSpatializationListenerError> {
+        if channels_out < 1 || channels_out > 8 {
+            return Err(AudioSpatializationListenerError::InvalidChannels(
+                channels_out,
+            ));
+        }
+
         unsafe {
             let mut spatializer = Box::<ma_spatializer_listener>::new_uninit();
             let config = ma_spatializer_listener_config_init(channels_out);
@@ -17,7 +46,9 @@ impl AudioSpatializationListener {
             );
 
             if result != 0 {
-                return Err(format!("Failed to initialize spatializer: {}", result));
+                return Err(AudioSpatializationListenerError::InitializationFailed(
+                    result,
+                ));
             }
 
             let spatializer = spatializer.assume_init();
@@ -138,19 +169,42 @@ impl Drop for AudioSpatializationListener {
     }
 }
 
+/// Trait for handling audio spatialization listener attributes.
+/// This trait provides methods to set and get various attributes of the spatialization listener.
+/// It is used to manage the spatialization of audio in a 3D space.
 pub trait AudioSpartialListenerHandler {
-    fn set_position(&self, x: f32, y: f32, z: f32) -> Result<(), String>;
-    fn get_position(&self) -> Result<(f32, f32, f32), String>;
-    fn set_direction(&self, x: f32, y: f32, z: f32) -> Result<(), String>;
-    fn get_direction(&self) -> Result<(f32, f32, f32), String>;
-    fn set_velocity(&self, x: f32, y: f32, z: f32) -> Result<(), String>;
-    fn get_velocity(&self) -> Result<(f32, f32, f32), String>;
-    fn set_speed_of_sound(&self, speed: f32) -> Result<(), String>;
-    fn get_speed_of_sound(&self) -> Result<f32, String>;
-    fn set_world_up(&self, x: f32, y: f32, z: f32) -> Result<(), String>;
-    fn get_world_up(&self) -> Result<(f32, f32, f32), String>;
-    fn set_cone(&self, inner_angle: f32, outer_angle: f32, outer_gain: f32) -> Result<(), String>;
-    fn get_cone(&self) -> Result<(f32, f32, f32), String>;
-    fn set_enabled(&self, is_enabled: bool) -> Result<(), String>;
-    fn is_enabled(&self) -> Result<bool, String>;
+    /// Set the position of the listener in 3D space.
+    fn set_position(&self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationListenerError>;
+    /// Get the position of the listener in 3D space.
+    fn get_position(&self) -> Result<(f32, f32, f32), AudioSpatializationListenerError>;
+    /// Set the direction of the listener in 3D space.
+    fn set_direction(&self, x: f32, y: f32, z: f32)
+    -> Result<(), AudioSpatializationListenerError>;
+    /// Get the direction of the listener in 3D space.
+    fn get_direction(&self) -> Result<(f32, f32, f32), AudioSpatializationListenerError>;
+    /// Set the velocity of the listener in 3D space.
+    fn set_velocity(&self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationListenerError>;
+    /// Get the velocity of the listener in 3D space.
+    fn get_velocity(&self) -> Result<(f32, f32, f32), AudioSpatializationListenerError>;
+    /// Set the speed of sound for the listener.
+    fn set_speed_of_sound(&self, speed: f32) -> Result<(), AudioSpatializationListenerError>;
+    /// Get the speed of sound for the listener.
+    fn get_speed_of_sound(&self) -> Result<f32, AudioSpatializationListenerError>;
+    /// Set the world up vector for the listener.
+    fn set_world_up(&self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationListenerError>;
+    /// Get the world up vector for the listener.
+    fn get_world_up(&self) -> Result<(f32, f32, f32), AudioSpatializationListenerError>;
+    /// Set the cone parameters for the listener.
+    fn set_cone(
+        &self,
+        inner_angle: f32,
+        outer_angle: f32,
+        outer_gain: f32,
+    ) -> Result<(), AudioSpatializationListenerError>;
+    /// Get the cone parameters for the listener.
+    fn get_cone(&self) -> Result<(f32, f32, f32), AudioSpatializationListenerError>;
+    /// Set whether the listener is enabled or not.
+    fn set_enabled(&self, is_enabled: bool) -> Result<(), AudioSpatializationListenerError>;
+    /// Check if the listener is enabled.
+    fn is_enabled(&self) -> Result<bool, AudioSpatializationListenerError>;
 }

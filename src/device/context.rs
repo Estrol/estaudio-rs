@@ -2,6 +2,38 @@ use std::sync::{Arc, Mutex};
 
 use miniaudio_sys::*;
 
+use crate::utils;
+
+#[derive(Debug, Clone, Copy)]
+#[must_use]
+pub enum AudioContextError {
+    InitializationFailed(i32),
+    DeviceEnumerationFailed(i32),
+}
+
+impl std::fmt::Display for AudioContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioContextError::InitializationFailed(code) => {
+                write!(
+                    f,
+                    "Audio context initialization failed with code: {} ({})",
+                    code,
+                    utils::ma_to_string_result(*code)
+                )
+            }
+            AudioContextError::DeviceEnumerationFailed(code) => {
+                write!(
+                    f,
+                    "Audio device enumeration failed with code: {}, ({})",
+                    code,
+                    utils::ma_to_string_result(*code)
+                )
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AudioDeviceType {
     Playback,
@@ -22,7 +54,7 @@ pub struct AudioHardwareInfo {
 }
 
 impl AudioContext {
-    pub(crate) fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, AudioContextError> {
         // SAFETY: This code is safe because it initializes the audio context and sets up the necessary configurations.
         // The code ensures that the context is properly initialized and can be used for audio operations.
         unsafe {
@@ -35,7 +67,7 @@ impl AudioContext {
             );
 
             if result != MA_SUCCESS {
-                return Err(format!("Failed to initialize context: {}", result));
+                return Err(AudioContextError::InitializationFailed(result));
             }
 
             let context = context.assume_init();
@@ -46,9 +78,12 @@ impl AudioContext {
     }
 }
 
-pub(crate) fn enumerable(context: AudioContext) -> Result<Vec<AudioHardwareInfo>, String> {
-    let mut context_lock = context.context.lock().unwrap();
-
+pub(crate) fn enumerable(
+    context: AudioContext,
+) -> Result<Vec<AudioHardwareInfo>, AudioContextError> {
+    // SAFETY: As long the context is properly initialized
+    // the data is always valid and the pointers are not null
+    // within the *count* range.
     unsafe {
         let mut playback_info_array: *mut ma_device_info = std::ptr::null_mut();
         let mut playback_count = 0;
@@ -56,19 +91,21 @@ pub(crate) fn enumerable(context: AudioContext) -> Result<Vec<AudioHardwareInfo>
         let mut capture_info_array: *mut ma_device_info = std::ptr::null_mut();
         let mut capture_count = 0;
 
-        let result = ma_context_get_devices(
-            context_lock.as_mut(),
-            &mut playback_info_array,
-            &mut playback_count,
-            &mut capture_info_array,
-            &mut capture_count,
-        );
+        let result = {
+            let mut context_lock = context.context.lock().unwrap();
+
+            ma_context_get_devices(
+                context_lock.as_mut(),
+                &mut playback_info_array,
+                &mut playback_count,
+                &mut capture_info_array,
+                &mut capture_count,
+            )
+        };
 
         if result != MA_SUCCESS {
-            return Err(format!("Failed to get devices: {}", result));
+            return Err(AudioContextError::DeviceEnumerationFailed(result));
         }
-
-        drop(context_lock);
 
         let context = Arc::new(Mutex::new(context));
 

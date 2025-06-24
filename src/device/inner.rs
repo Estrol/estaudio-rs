@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::{
     channel::inner::AudioChannelInner,
+    device::AudioDeviceError,
     effects::{AudioFX, AudioPanner, AudioResampler, AudioSpatializationListener, AudioVolume},
     mixer::inner::AudioMixerInner,
     utils::{self, MutexPoison},
@@ -54,7 +55,7 @@ impl AudioDeviceInner {
         info: Option<&AudioHardwareInfo>,
         channels: u32,
         sample_rate: u32,
-    ) -> Result<Box<AudioDeviceInner>, String> {
+    ) -> Result<Box<AudioDeviceInner>, AudioDeviceError> {
         unsafe {
             let mut inner = Box::new(AudioDeviceInner {
                 device: Box::new(std::mem::zeroed()),
@@ -64,9 +65,10 @@ impl AudioDeviceInner {
                 temp_buffer: vec![0.0f32; 4096 * channels as usize],
                 resampler_buffer: vec![0.0f32; 4096 * channels as usize],
                 spatialization: None,
-                volume: AudioVolume::new(channels)?,
-                panner: AudioPanner::new(channels)?,
-                resampler: AudioResampler::new(channels, sample_rate)?,
+                volume: AudioVolume::new(channels).map_err(AudioDeviceError::AudioVolumeError)?,
+                panner: AudioPanner::new(channels).map_err(AudioDeviceError::AudioPannerError)?,
+                resampler: AudioResampler::new(channels, sample_rate)
+                    .map_err(AudioDeviceError::AudioResamplerError)?,
                 dsp_callback: None,
                 fx: None,
             });
@@ -94,19 +96,23 @@ impl AudioDeviceInner {
             };
 
             if result != MA_SUCCESS {
-                return Err(format!("Failed to initialize device: {}", result));
+                return Err(AudioDeviceError::InitializationError(result));
             }
 
             let result = ma_device_start(inner.device.as_mut());
             if result != MA_SUCCESS {
-                return Err(format!("Failed to start device: {}", result));
+                return Err(AudioDeviceError::InitializationError(result));
             }
 
             Ok(inner)
         }
     }
 
-    pub fn process(&mut self, output: &mut [f32], frame_count: u64) -> Result<(), String> {
+    pub fn process(
+        &mut self,
+        output: &mut [f32],
+        frame_count: u64,
+    ) -> Result<(), AudioDeviceError> {
         utils::array_fast_set_value_f32(output, 0.0);
 
         let mut channels = self.channels.lock_poison();
@@ -118,11 +124,8 @@ impl AudioDeviceInner {
 
         let required_frame_count = self.resampler.get_required_input(frame_count);
 
-        if required_frame_count.is_err() {
-            return Err(format!(
-                "Error getting required frame count: {}",
-                required_frame_count.err().unwrap()
-            ));
+        if let Err(e) = required_frame_count {
+            return Err(AudioDeviceError::AudioResamplerError(e));
         }
 
         let required_frame_count = required_frame_count.unwrap();
@@ -138,11 +141,9 @@ impl AudioDeviceInner {
 
             if !fx.tempo_bypass() {
                 let required_frame_count = fx.get_required_input(frame_count);
-                if required_frame_count.is_err() {
-                    return Err(format!(
-                        "Error getting required frame count: {}",
-                        required_frame_count.err().unwrap()
-                    ));
+
+                if let Err(e) = required_frame_count {
+                    return Err(AudioDeviceError::AudioFXError(e));
                 }
 
                 target_frame_count = required_frame_count.unwrap();
@@ -211,11 +212,8 @@ impl AudioDeviceInner {
                     readed_frame_count,
                 );
 
-                if readed.is_err() {
-                    return Err(format!(
-                        "Error processing audio FX: {}",
-                        readed.err().unwrap()
-                    ));
+                if let Err(e) = readed {
+                    return Err(AudioDeviceError::AudioFXError(e));
                 }
 
                 fx.frame_available -= readed_frame_count as i64;
@@ -283,12 +281,14 @@ impl AudioDeviceInner {
         }
 
         if !self.resampler.bypass_mode() {
-            self.resampler.process(
-                &self.resampler_buffer,
-                required_frame_count,
-                output,
-                frame_count,
-            )?;
+            self.resampler
+                .process(
+                    &self.resampler_buffer,
+                    required_frame_count,
+                    output,
+                    frame_count,
+                )
+                .map_err(AudioDeviceError::AudioResamplerError)?;
         } else {
             utils::array_fast_copy_f32(
                 &self.resampler_buffer,
@@ -299,8 +299,13 @@ impl AudioDeviceInner {
             );
         }
 
-        self.panner.process(output, &mut self.buffer, frame_count)?;
-        self.volume.process(&self.buffer, output, frame_count)?;
+        self.panner
+            .process(output, &mut self.buffer, frame_count)
+            .map_err(AudioDeviceError::AudioPannerError)?;
+
+        self.volume
+            .process(&self.buffer, output, frame_count)
+            .map_err(AudioDeviceError::AudioVolumeError)?;
 
         // Apply DSP callback if set
         if let Some(dsp_callback) = self.dsp_callback.as_ref() {
@@ -342,29 +347,57 @@ impl AudioDeviceInner {
         Ok(())
     }
 
-    pub fn add_channel(&mut self, channel: Arc<Mutex<AudioChannelInner>>) -> Result<(), String> {
+    pub fn add_channel(
+        &mut self,
+        channel: Arc<Mutex<AudioChannelInner>>,
+    ) -> Result<(), AudioDeviceError> {
         let mut channels = self.channels.lock_poison();
+
+        let channel_lock = channel.lock_poison();
+        if channels
+            .iter()
+            .any(|c| c.lock_poison().ref_id == channel_lock.ref_id)
+        {
+            return Err(AudioDeviceError::ChannelAlreadyExists(channel_lock.ref_id));
+        }
+
+        drop(channel_lock);
+
         channels.push(channel);
         Ok(())
     }
 
-    pub fn remove_channel(&mut self, channel: usize) -> Result<(), String> {
+    pub fn remove_channel(&mut self, channel: usize) -> Result<(), AudioDeviceError> {
         let mut channels = self.channels.lock_poison();
         if channel < channels.len() {
             channels.remove(channel);
             Ok(())
         } else {
-            Err(format!("Channel with ID {} not found", channel))
+            Err(AudioDeviceError::ChannelNotFound(channel))
         }
     }
 
-    pub fn add_mixer(&mut self, mixer: Arc<Mutex<AudioMixerInner>>) -> Result<(), String> {
+    pub fn add_mixer(
+        &mut self,
+        mixer: Arc<Mutex<AudioMixerInner>>,
+    ) -> Result<(), AudioDeviceError> {
         let mut mixers = self.mixers.lock_poison();
+
+        let mixer_lock = mixer.lock_poison();
+        if mixers
+            .iter()
+            .any(|m| m.lock_poison().ref_id == mixer_lock.ref_id)
+        {
+            return Err(AudioDeviceError::MixerAlreadyExists(mixer_lock.ref_id));
+        }
+
+        drop(mixer_lock);
+
         mixers.push(mixer);
         Ok(())
     }
 
-    pub fn remove_mixer(&mut self, mixer: usize) -> Result<(), String> {
+    pub fn remove_mixer(&mut self, mixer: usize) -> Result<(), AudioDeviceError> {
         let mut mixers = self.mixers.lock_poison();
         let mut index_to_remove = None;
 
@@ -381,7 +414,7 @@ impl AudioDeviceInner {
             mixers.remove(index);
             Ok(())
         } else {
-            Err(format!("Mixer with ID {} not found", mixer))
+            Err(AudioDeviceError::MixerNotFound(mixer))
         }
     }
 }

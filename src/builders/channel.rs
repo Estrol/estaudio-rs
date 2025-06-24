@@ -1,12 +1,36 @@
 use crate::{
-    channel::AudioChannel,
-    device::{AudioAttributes, AudioDevice, AudioPropertyHandler},
+    channel::{AudioChannel, AudioChannelError},
+    device::{
+        AudioAttributes, AudioDevice, AudioDeviceError, AudioPropertyError, AudioPropertyHandler,
+    },
 };
 
 use super::AudioBufferDesc;
 
+#[derive(Debug)]
+pub enum AudioChannelBuilderError {
+    NoFileOrBufferProvided,
+    AudioDeviceError(AudioDeviceError),
+    AudioChannelError(AudioChannelError),
+    AudioPropertyError(AudioPropertyError),
+}
+
+impl std::fmt::Display for AudioChannelBuilderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioChannelBuilderError::NoFileOrBufferProvided => {
+                write!(f, "No file or buffer provided for audio channel")
+            }
+            AudioChannelBuilderError::AudioDeviceError(err) => write!(f, "Audio device error: {}", err),
+            AudioChannelBuilderError::AudioChannelError(err) => write!(f, "Audio channel error: {}", err),
+            AudioChannelBuilderError::AudioPropertyError(err) => write!(f, "Audio property error: {}", err),
+        }
+    }
+}
+
+/// A builder for creating audio channels.
 pub struct AudioChannelBuilder<'a> {
-    pub device: Option<&'a AudioDevice>,
+    pub device: Option<&'a mut AudioDevice>,
     pub file_path: Option<String>,
     pub file_buffer: Option<&'a [u8]>,
     pub audio_buffer: Option<AudioBufferDesc<'a>>,
@@ -51,47 +75,61 @@ impl<'a> AudioChannelBuilder<'a> {
     }
 
     /// Auto attach the audio channel to the device.
-    pub fn device(mut self, device: &'a AudioDevice) -> Self {
+    pub fn device(mut self, device: &'a mut AudioDevice) -> Self {
         self.device = Some(device);
         self
     }
 
-    /// Enable additional effects using [signalsmitch-strech](https://github.com/Signalsmith-Audio/signalsmith-stretch), this may introduce latency to the audio channel.
+    /// Enable AudioFX, this is for time stretching and pitch shifting.
+    ///
+    /// This will enable [AudioAttributes::AudioFX] on the device.
     pub fn enable_fx(mut self, enable: bool) -> Self {
         self.enable_fx = enable;
         self
     }
 
-    /// Enable spatialization for the audio channel.
+    /// Enable spatialization, this is useful for 3D audio.
+    ///
+    /// This will enable [AudioAttributes::AudioSpatialization] on the device.
     pub fn enable_spatialization(mut self, enable: bool) -> Self {
         self.enable_spatialization = enable;
         self
     }
 
-    pub fn build(self) -> Result<AudioChannel, String> {
+    /// Construct the audio channel.
+    pub fn build(self) -> Result<AudioChannel, AudioChannelBuilderError> {
         let channel = if let Some(file_path) = self.file_path {
-            AudioChannel::new_file(&file_path)?
+            AudioChannel::new_file(&file_path)
+                .map_err(AudioChannelBuilderError::AudioChannelError)?
         } else if let Some(buffer) = self.file_buffer {
-            AudioChannel::new_file_buffer(&buffer)?
+            AudioChannel::new_file_buffer(&buffer)
+                .map_err(AudioChannelBuilderError::AudioChannelError)?
         } else if let Some(audio_buffer) = self.audio_buffer {
             AudioChannel::new_audio_buffer(
                 &audio_buffer.buffer,
                 audio_buffer.pcm_length,
                 audio_buffer.sample_rate,
                 audio_buffer.channels,
-            )?
+            )
+            .map_err(AudioChannelBuilderError::AudioChannelError)?
         } else {
-            return Err("No file path or buffer provided".to_string());
+            return Err(AudioChannelBuilderError::NoFileOrBufferProvided);
         };
 
-        channel.set_attribute_bool(
-            AudioAttributes::AudioSpatialization,
-            self.enable_spatialization,
-        )?;
-        channel.set_attribute_bool(AudioAttributes::AudioFX, self.enable_fx)?;
+        channel
+            .set_attribute_bool(
+                AudioAttributes::AudioSpatialization,
+                self.enable_spatialization,
+            )
+            .map_err(AudioChannelBuilderError::AudioPropertyError)?;
+        channel
+            .set_attribute_bool(AudioAttributes::AudioFX, self.enable_fx)
+            .map_err(AudioChannelBuilderError::AudioPropertyError)?;
 
         if let Some(device) = self.device {
-            device.add_channel(&channel)?;
+            device
+                .add_channel(&channel)
+                .map_err(AudioChannelBuilderError::AudioDeviceError)?;
         }
 
         Ok(channel)

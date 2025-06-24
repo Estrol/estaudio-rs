@@ -1,3 +1,5 @@
+//! Helpers for building audio objects.
+
 pub struct AudioBufferDesc<'a> {
     pub buffer: &'a [f32],
     pub pcm_length: u64,
@@ -5,10 +7,10 @@ pub struct AudioBufferDesc<'a> {
     pub channels: u32,
 }
 
-pub mod channel;
-pub mod device;
-pub mod mixer;
-pub mod sample;
+mod channel;
+mod device;
+mod mixer;
+mod sample;
 
 pub use channel::AudioChannelBuilder;
 pub use device::AudioDeviceBuilder;

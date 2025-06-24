@@ -8,6 +8,49 @@ use miniaudio_sys::*;
 
 use crate::utils;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum AudioReaderError {
+    FileNotFound(String),
+    OggError(AudioOggError),
+    InitializationError(i32),
+    InvalidFileFormat,
+    InvalidPCMLength,
+    InvalidOperation,
+    PCMLengthTooLarge,
+    BufferTooSmall { expected: usize, actual: usize },
+    SeekError(i32),
+}
+
+impl std::fmt::Display for AudioReaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioReaderError::FileNotFound(path) => write!(f, "File not found: {}", path),
+            AudioReaderError::OggError(e) => write!(f, "OGG error: {:?}", e),
+            AudioReaderError::InitializationError(code) => {
+                write!(
+                    f,
+                    "Initialization error with code: {} ({})",
+                    code,
+                    utils::ma_to_string_result(*code)
+                )
+            }
+            AudioReaderError::InvalidFileFormat => write!(f, "Invalid file format"),
+            AudioReaderError::InvalidPCMLength => write!(f, "Invalid PCM length"),
+            AudioReaderError::InvalidOperation => write!(f, "Invalid operation"),
+            AudioReaderError::PCMLengthTooLarge => write!(f, "PCM length is too large"),
+            AudioReaderError::BufferTooSmall { expected, actual } => {
+                write!(f, "Buffer too small: expected {}, got {}", expected, actual)
+            }
+            AudioReaderError::SeekError(code) => write!(
+                f,
+                "Seek error with code: {} ({})",
+                code,
+                utils::ma_to_string_result(*code)
+            ),
+        }
+    }
+}
+
 pub struct AudioReader {
     pub decoder: Option<Box<ma_decoder>>,
     pub audio_buffer: Option<Box<ma_audio_buffer>>,
@@ -19,13 +62,19 @@ pub struct AudioReader {
 }
 
 impl AudioReader {
-    pub fn load(file_path: &str) -> Result<Self, String> {
+    pub fn load(file_path: &str) -> Result<Self, AudioReaderError> {
         if !std::path::Path::new(file_path).exists() {
-            return Err(format!("File not found: {}", file_path));
+            return Err(AudioReaderError::FileNotFound(file_path.to_string()));
         }
 
         if is_ogg(file_path) {
-            let audio_buffer = read_ogg_data_file(file_path)?;
+            let audio_buffer = read_ogg_data_file(file_path);
+            if let Err(e) = audio_buffer {
+                return Err(AudioReaderError::OggError(e));
+            }
+
+            let audio_buffer = audio_buffer.unwrap();
+
             let sample_rate = audio_buffer.ref_.sampleRate;
             let channels = audio_buffer.ref_.channels;
             let pcm_length = audio_buffer.ref_.sizeInFrames;
@@ -40,7 +89,13 @@ impl AudioReader {
             });
         }
 
-        let c_file_path = std::ffi::CString::new(file_path).map_err(|e| e.to_string())?;
+        let c_file_path = std::ffi::CString::new(file_path);
+        if let Err(_) = c_file_path {
+            return Err(AudioReaderError::InvalidFileFormat);
+        }
+
+        let c_file_path = c_file_path.unwrap();
+
         unsafe {
             let mut decoder = Box::<ma_decoder>::new_uninit();
             let decoder_config = ma_decoder_config_init(ma_format_f32, 2, 44100);
@@ -52,10 +107,7 @@ impl AudioReader {
             );
 
             if result != MA_SUCCESS {
-                return Err(format!(
-                    "Failed to initialize decoder: {}",
-                    utils::ma_to_string_result(result)
-                ));
+                return Err(AudioReaderError::InitializationError(result));
             }
 
             let mut decoder = decoder.assume_init();
@@ -65,16 +117,17 @@ impl AudioReader {
             if result != MA_SUCCESS {
                 ma_decoder_uninit(decoder.as_mut());
 
-                return Err(format!(
-                    "Failed to get PCM length: {}",
-                    utils::ma_to_string_result(result)
-                ));
+                // return Err(format!(
+                //     "Failed to get PCM length: {}",
+                //     utils::ma_to_string_result(result)
+                // ));
+                return Err(AudioReaderError::InitializationError(result));
             }
 
             if pcm_length == 0 {
                 ma_decoder_uninit(decoder.as_mut());
 
-                return Err("PCM length is zero".to_string());
+                return Err(AudioReaderError::InvalidPCMLength);
             }
 
             let sample_rate = decoder_config.sampleRate;
@@ -91,9 +144,15 @@ impl AudioReader {
         }
     }
 
-    pub fn load_file_buffer(buffer: &[u8]) -> Result<Self, String> {
+    pub fn load_file_buffer(buffer: &[u8]) -> Result<Self, AudioReaderError> {
         if is_ogg_buffer(buffer) {
-            let audio_buffer = read_ogg_data_buffer(buffer)?;
+            let audio_buffer = read_ogg_data_buffer(buffer);
+            if let Err(e) = audio_buffer {
+                return Err(AudioReaderError::OggError(e));
+            }
+
+            let audio_buffer = audio_buffer.unwrap();
+
             let sample_rate = audio_buffer.ref_.sampleRate;
             let channels = audio_buffer.ref_.channels;
             let pcm_length = audio_buffer.ref_.sizeInFrames;
@@ -120,10 +179,7 @@ impl AudioReader {
             );
 
             if result != MA_SUCCESS {
-                return Err(format!(
-                    "Failed to initialize decoder: {}",
-                    utils::ma_to_string_result(result)
-                ));
+                return Err(AudioReaderError::InitializationError(result));
             }
 
             let mut decoder = decoder.assume_init();
@@ -133,16 +189,13 @@ impl AudioReader {
             if result != MA_SUCCESS {
                 ma_decoder_uninit(decoder.as_mut());
 
-                return Err(format!(
-                    "Failed to get PCM length: {}",
-                    utils::ma_to_string_result(result)
-                ));
+                return Err(AudioReaderError::InitializationError(result));
             }
 
             if pcm_length == 0 {
                 ma_decoder_uninit(decoder.as_mut());
 
-                return Err("PCM length is zero".to_string());
+                return Err(AudioReaderError::InvalidPCMLength);
             }
 
             let sample_rate = decoder_config.sampleRate;
@@ -165,7 +218,7 @@ impl AudioReader {
         channels: u32,
         pcm_length: u64,
         owned: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, AudioReaderError> {
         unsafe {
             let mut audio_buffer = Box::<ma_audio_buffer>::new_uninit();
             let mut config = ma_audio_buffer_config_init(
@@ -190,10 +243,7 @@ impl AudioReader {
             };
 
             if result != MA_SUCCESS {
-                return Err(format!(
-                    "Failed to initialize audio buffer: {}",
-                    utils::ma_to_string_result(result)
-                ));
+                return Err(AudioReaderError::InitializationError(result));
             }
 
             let audio_buffer = audio_buffer.assume_init();
@@ -209,18 +259,17 @@ impl AudioReader {
         }
     }
 
-    pub fn read(&mut self, buffer: &mut [f32], size: u64) -> Result<u64, String> {
+    pub fn read(&mut self, buffer: &mut [f32], size: u64) -> Result<u64, AudioReaderError> {
         if size == 0 {
-            return Err("Size must be greater than 0".to_string());
+            return Err(AudioReaderError::InvalidPCMLength);
         }
 
         let expected_array_size = (size * self.channels as u64) as usize;
         if buffer.len() < expected_array_size {
-            return Err(format!(
-                "Buffer size is too small. Expected: {}, Actual: {}",
-                expected_array_size,
-                buffer.len()
-            ));
+            return Err(AudioReaderError::BufferTooSmall {
+                expected: expected_array_size,
+                actual: buffer.len(),
+            });
         }
 
         let mut frames_readed = 0;
@@ -245,41 +294,32 @@ impl AudioReader {
                     &mut frames_readed,
                 )
             } else {
-                return Err("Decoder not initialized".to_string());
+                unreachable!() // Decoder or audio buffer must be initialized
             }
         };
 
         if result != MA_SUCCESS {
-            return Err(format!(
-                "Failed to read PCM frames: {}",
-                utils::ma_to_string_result(result)
-            ));
+            return Err(AudioReaderError::InvalidOperation);
         }
 
         self.position += frames_readed;
         Ok(frames_readed)
     }
 
-    pub fn seek(&mut self, position: u64) -> Result<(), String> {
+    pub fn seek(&mut self, position: u64) -> Result<(), AudioReaderError> {
         if let Some(decoder) = self.decoder.as_mut() {
             let result = unsafe { ma_decoder_seek_to_pcm_frame(decoder.as_mut(), position) };
             if result != MA_SUCCESS {
-                return Err(format!(
-                    "Failed to seek PCM frame: {}",
-                    utils::ma_to_string_result(result)
-                ));
+                return Err(AudioReaderError::SeekError(result));
             }
         } else if let Some(audio_buffer) = self.audio_buffer.as_mut() {
             let result =
                 unsafe { ma_audio_buffer_seek_to_pcm_frame(audio_buffer.as_mut(), position) };
             if result != MA_SUCCESS {
-                return Err(format!(
-                    "Failed to seek PCM frame: {}",
-                    utils::ma_to_string_result(result)
-                ));
+                return Err(AudioReaderError::SeekError(result));
             }
         } else {
-            return Err("Decoder not initialized".to_string());
+            unreachable!(); // Decoder or audio buffer must be initialized
         }
 
         self.position = position;
@@ -303,6 +343,13 @@ impl Drop for AudioReader {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum AudioOggError {
+    InvalidFileFormat,
+    UnknownFormat,
+    ReadError(&'static str),
+}
+
 pub fn is_ogg(file_path: &str) -> bool {
     const OGG_HEADER: &[u8] = b"OggS";
 
@@ -324,65 +371,92 @@ pub fn is_ogg_buffer(buffer: &[u8]) -> bool {
     &buffer[0..4] == OGG_HEADER
 }
 
-pub fn read_ogg_data_file(file_path: &str) -> Result<Box<ma_audio_buffer>, String> {
+pub fn read_ogg_data_file(file_path: &str) -> Result<Box<ma_audio_buffer>, AudioOggError> {
     if !is_ogg(file_path) {
-        return Err(format!("File is not a valid OGG file: {}", file_path));
+        return Err(AudioOggError::InvalidFileFormat);
     }
 
-    let file = std::fs::File::open(file_path).map_err(|e| e.to_string())?;
+    let file = std::fs::File::open(file_path);
+    if let Err(_) = file {
+        return Err(AudioOggError::ReadError("Failed to open OGG file"));
+    }
+
+    let file = file.unwrap();
+
     let mut reader = BufReader::new(file);
 
-    let _type = get_ogg_type(&mut reader).map_err(|e| e.to_string())?;
+    let _type = get_ogg_type(&mut reader);
+    if let Err(e) = _type {
+        return Err(e);
+    }
 
-    reader
-        .seek(std::io::SeekFrom::Start(0x0))
-        .map_err(|e| e.to_string())?;
+    let _type = _type.unwrap();
+
+    let err = reader.seek(std::io::SeekFrom::Start(0x0));
+
+    if err.is_err() {
+        return Err(AudioOggError::ReadError("Failed to seek in OGG file"));
+    }
 
     match _type {
         Some(OggType::Opus) => {
             return read_ogg_opus(reader);
         }
         Some(OggType::Vorbis) => {
-            let reader = OggStreamReader::new(reader).map_err(|e| e.to_string())?;
+            let reader = OggStreamReader::new(reader);
 
-            return read_ogg_vorbis(reader);
+            if let Err(_) = reader {
+                return Err(AudioOggError::ReadError("Failed to read OGG Vorbis data"));
+            }
+
+            return read_ogg_vorbis(reader.unwrap());
         }
         _ => {
-            return Err("Unknown OGG format".to_string());
+            return Err(AudioOggError::UnknownFormat);
         }
     }
 }
 
-pub fn read_ogg_data_buffer(buffer: &[u8]) -> Result<Box<ma_audio_buffer>, String> {
+pub fn read_ogg_data_buffer(buffer: &[u8]) -> Result<Box<ma_audio_buffer>, AudioOggError> {
     if !is_ogg_buffer(buffer) {
-        return Err("Buffer is not a valid OGG file".to_string());
+        return Err(AudioOggError::InvalidFileFormat);
     }
 
     let mut reader = BufReader::new(Cursor::new(buffer));
-    let _type = get_ogg_type(&mut reader).map_err(|e| e.to_string())?;
+    let _type = get_ogg_type(&mut reader);
+    if let Err(e) = _type {
+        return Err(e);
+    }
 
-    reader
-        .seek(std::io::SeekFrom::Start(0x0))
-        .map_err(|e| e.to_string())?;
+    let _type = _type.unwrap();
+
+    let err = reader.seek(std::io::SeekFrom::Start(0x0));
+
+    if err.is_err() {
+        return Err(AudioOggError::ReadError("Failed to seek in OGG file"));
+    }
 
     match _type {
         Some(OggType::Opus) => {
             return read_ogg_opus(reader);
         }
         Some(OggType::Vorbis) => {
-            let reader = OggStreamReader::new(reader).map_err(|e| e.to_string())?;
+            let reader = OggStreamReader::new(reader);
+            if let Err(_) = reader {
+                return Err(AudioOggError::ReadError("Failed to read OGG Vorbis data"));
+            }
 
-            return read_ogg_vorbis(reader);
+            return read_ogg_vorbis(reader.unwrap());
         }
         _ => {
-            return Err("Unknown OGG format".to_string());
+            return Err(AudioOggError::UnknownFormat);
         }
     }
 }
 
 fn read_ogg_vorbis<T: Read + Seek>(
     mut reader: OggStreamReader<T>,
-) -> Result<Box<ma_audio_buffer>, String> {
+) -> Result<Box<ma_audio_buffer>, AudioOggError> {
     let mut pcm_f32 = Vec::new();
 
     while let Ok(Some(packet)) = reader.read_dec_packet_itl() {
@@ -410,10 +484,7 @@ fn read_ogg_vorbis<T: Read + Seek>(
             ma_audio_buffer_init_copy(&config, audio_buffer.as_mut_ptr() as *mut ma_audio_buffer);
 
         if result != MA_SUCCESS {
-            return Err(format!(
-                "Failed to initialize audio buffer: {}",
-                utils::ma_to_string_result(result)
-            ));
+            return Err(AudioOggError::ReadError(utils::ma_to_string_result(result)));
         }
 
         let audio_buffer = audio_buffer.assume_init();
@@ -422,9 +493,13 @@ fn read_ogg_vorbis<T: Read + Seek>(
     }
 }
 
-fn read_ogg_opus<T: Seek + Read>(data: T) -> Result<Box<ma_audio_buffer>, String> {
-    let decoded = ogg_opus::decode::<T, 48000>(data)
-        .map_err(|e| format!("Failed to decode Opus data: {}", e))?;
+fn read_ogg_opus<T: Seek + Read>(data: T) -> Result<Box<ma_audio_buffer>, AudioOggError> {
+    let decoded = ogg_opus::decode::<T, 48000>(data);
+    if let Err(_) = decoded {
+        return Err(AudioOggError::ReadError("Failed to decode OGG Opus data"));
+    }
+
+    let decoded = decoded.unwrap();
 
     let mut pcm_f32 = Vec::new();
     for frame in decoded.0.iter() {
@@ -452,10 +527,7 @@ fn read_ogg_opus<T: Seek + Read>(data: T) -> Result<Box<ma_audio_buffer>, String
             ma_audio_buffer_init_copy(&config, audio_buffer.as_mut_ptr() as *mut ma_audio_buffer);
 
         if result != MA_SUCCESS {
-            return Err(format!(
-                "Failed to initialize audio buffer: {}",
-                utils::ma_to_string_result(result)
-            ));
+            return Err(AudioOggError::ReadError(utils::ma_to_string_result(result)));
         }
 
         let audio_buffer = audio_buffer.assume_init();
@@ -471,24 +543,26 @@ pub enum OggType {
     Opus,
 }
 
-pub fn get_ogg_type<T: Read + Seek>(reader: &mut T) -> Result<Option<OggType>, String> {
+pub fn get_ogg_type<T: Read + Seek>(reader: &mut T) -> Result<Option<OggType>, AudioOggError> {
     // check header
     let mut header = [0; 4];
     if reader.read_exact(&mut header).is_err() {
-        return Err("Failed to read OGG header".to_string());
+        return Err(AudioOggError::ReadError("Failed to read OGG header"));
     }
 
     if &header != b"OggS" {
-        return Err("Invalid OGG header".to_string());
+        return Err(AudioOggError::InvalidFileFormat);
     }
 
-    reader
-        .seek(std::io::SeekFrom::Start(0x1C))
-        .map_err(|e| e.to_string())?;
+    let err = reader.seek(std::io::SeekFrom::Start(0x1C));
+
+    if err.is_err() {
+        return Err(AudioOggError::ReadError("Failed to seek in OGG file"));
+    }
 
     let mut data = [0u8; 8];
     if reader.read_exact(&mut data).is_err() {
-        return Err("Failed to read OGG data".to_string());
+        return Err(AudioOggError::ReadError("Failed to read OGG type data"));
     }
 
     let mut ogg_type = OggType::Unknown;

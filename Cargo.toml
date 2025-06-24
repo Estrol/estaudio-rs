@@ -1,12 +1,19 @@
 [package]
-name = "estaudioengine"
+name = "est-audio"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 as-any = "0.3.2"
 lewton = "0.10.2"
-miniaudio-sys = { package = "om-fork-ep-miniaudio-sys", git = "https://github.com/Estrol/miniaudio-rs" }
+miniaudio-sys = { package = "est-audio-fork-ep-miniaudio-sys", git = "https://github.com/Estrol/miniaudio-rs" }
 ogg = "0.9.2"
 ogg-opus = "0.1.2"
 signalsmith-stretch = { git = "https://github.com/Estrol/signalsmith-stretch-rs" }
+
+[package.metadata.capi]
+min_version = "0.6.10"
+
+[features]
+capi = []
+fx = []

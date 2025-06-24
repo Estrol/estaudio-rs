@@ -6,6 +6,7 @@ use std::sync::{
 use crate::{
     channel::inner::AudioChannelInner,
     effects::{AudioFX, AudioPanner, AudioResampler, AudioSpatializationListener, AudioVolume},
+    mixer::AudioMixerError,
     utils::{self, MutexPoison},
 };
 
@@ -23,6 +24,7 @@ pub(crate) struct AudioMixerEntry {
     pub duration: Option<u64>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct AudioMixerInner {
     pub ref_id: usize,
     pub marked_as_deleted: bool,
@@ -47,13 +49,25 @@ pub(crate) struct AudioMixerInner {
     pub fx: Option<AudioFX>,
 }
 
+#[allow(dead_code)]
 impl AudioMixerInner {
-    pub fn new(channels: u32, sample_rate: u32, ref_id: usize) -> Result<Self, String> {
+    pub fn new(channels: u32, sample_rate: u32, ref_id: usize) -> Result<Self, AudioMixerError> {
+        if channels < 1 || channels > 8 {
+            return Err(AudioMixerError::InvalidChannelCount);
+        }
+
+        if sample_rate < 8000 || sample_rate > 192000 {
+            return Err(AudioMixerError::InvalidSampleRate);
+        }
+
         let is_playing = Arc::new(AtomicBool::new(false));
 
-        let resampler = AudioResampler::new(channels, sample_rate)?;
-        let panner = AudioPanner::new(channels)?;
-        let volume = AudioVolume::new(channels)?;
+        let resampler = AudioResampler::new(channels, sample_rate)
+            .map_err(AudioMixerError::AudioResamplerError)?;
+
+        let panner = AudioPanner::new(channels).map_err(AudioMixerError::AudioPannerError)?;
+
+        let volume = AudioVolume::new(channels).map_err(AudioMixerError::AudioVolumeError)?;
 
         let inner = AudioMixerInner {
             ref_id,
@@ -84,20 +98,16 @@ impl AudioMixerInner {
         buffer: &mut [f32],
         temp_buffer: &mut [f32],
         frame_count: u64,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, AudioMixerError> {
         if !self.is_playing.load(Ordering::SeqCst) {
             return Ok(0);
         }
 
         let sample_count = frame_count as usize * self.channel_count;
-        let required_frame_count = self
-            .resampler
-            .get_required_input(frame_count)
-            .unwrap_or(0);
+        let required_frame_count = self.resampler.get_required_input(frame_count).unwrap_or(0);
 
         let mut mixed_sources = 0;
         if self.fx.is_some() {
-
             let mut target_frame_count = required_frame_count;
             let mut readed_frame_count = required_frame_count;
 
@@ -125,11 +135,8 @@ impl AudioMixerInner {
             let fx = self.fx.as_mut().unwrap();
 
             if fx.frame_available > 0 {
-                fx.process(
-                    buffer, 
-                    target_frame_count, 
-                    temp_buffer, 
-                    readed_frame_count)?;
+                fx.process(buffer, target_frame_count, temp_buffer, readed_frame_count)
+                    .map_err(AudioMixerError::AudioFXError)?;
 
                 fx.frame_available -= readed_frame_count as i64;
 
@@ -154,12 +161,9 @@ impl AudioMixerInner {
 
         if mixed_sources > 0 {
             if !self.resampler.bypass_mode() {
-                self.resampler.process(
-                    &self.buffer,
-                    required_frame_count,
-                    temp_buffer,
-                    frame_count,
-                )?;
+                self.resampler
+                    .process(&self.buffer, required_frame_count, temp_buffer, frame_count)
+                    .map_err(AudioMixerError::AudioResamplerError)?;
 
                 utils::array_fast_copy_f32(
                     temp_buffer,
@@ -170,20 +174,19 @@ impl AudioMixerInner {
                 );
             }
 
-            self.panner.process(&self.buffer, temp_buffer, frame_count)?;
-            self.volume.process(&temp_buffer, &mut self.buffer, frame_count)?;
+            self.panner
+                .process(&self.buffer, temp_buffer, frame_count)
+                .map_err(AudioMixerError::AudioPannerError)?;
+
+            self.volume
+                .process(&temp_buffer, &mut self.buffer, frame_count)
+                .map_err(AudioMixerError::AudioVolumeError)?;
 
             for i in 0..sample_count {
                 buffer[i] /= mixed_sources as f32;
             }
 
-            utils::array_fast_copy_f32(
-                &self.buffer,
-                buffer,
-                0,
-                0,
-                sample_count,
-            );
+            utils::array_fast_copy_f32(&self.buffer, buffer, 0, 0, sample_count);
         }
 
         if self.dsp_callback.is_some() {
@@ -202,7 +205,7 @@ impl AudioMixerInner {
         &mut self,
         temp_buffer: &mut [f32],
         frame_count: u64,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, AudioMixerError> {
         let mut mixed_sources = 0;
         let sample_count = frame_count as usize * self.channel_count;
 
@@ -214,9 +217,7 @@ impl AudioMixerInner {
         for mx_channel in &mut self.channels {
             if let Some(mut channel) = mx_channel.channel.try_lock_poison() {
                 let delay = mx_channel.delay.unwrap_or(0);
-                let duration = mx_channel
-                    .duration
-                    .unwrap_or(channel.reader.pcm_length);
+                let duration = mx_channel.duration.unwrap_or(channel.reader.pcm_length);
 
                 if self.mixer_position < delay || self.mixer_position >= delay + duration {
                     continue;
@@ -225,12 +226,14 @@ impl AudioMixerInner {
                 let remaining_frames = (delay + duration).saturating_sub(self.mixer_position);
                 let read_frames = frame_count.min(remaining_frames);
 
-                let channel_frame_count = channel.read_pcm_frames(
-                    None,
-                    &mut self.intermediate_buffer,
-                    temp_buffer,
-                    read_frames,
-                )?;
+                let channel_frame_count = channel
+                    .read_pcm_frames(
+                        None,
+                        &mut self.intermediate_buffer,
+                        temp_buffer,
+                        read_frames,
+                    )
+                    .map_err(AudioMixerError::AudioChannelError)?;
 
                 if channel_frame_count > 0 {
                     mixed_sources += 1;
@@ -284,7 +287,7 @@ impl AudioMixerInner {
         self.is_playing.load(Ordering::SeqCst)
     }
 
-    pub fn seek(&mut self, position: Option<u64>) -> Result<u64, String> {
+    pub fn seek(&mut self, position: Option<u64>) -> Result<u64, AudioMixerError> {
         self.mixer_position = 0;
         let mut max_channel_seeked = 0;
         let position = position.unwrap_or(0);
@@ -301,7 +304,10 @@ impl AudioMixerInner {
                 let relative_position = position - delay;
                 let limited_position = relative_position.min(duration);
 
-                let channel_seeked = channel.seek(limited_position)?;
+                let channel_seeked = channel
+                    .seek(limited_position)
+                    .map_err(AudioMixerError::AudioChannelError)?;
+
                 if delay + channel_seeked > max_channel_seeked {
                     max_channel_seeked = delay + channel_seeked;
                 }
@@ -336,7 +342,8 @@ impl AudioMixerInner {
                 self.mix_children_into_buffer(&mut temp_buffer, input_latency as u64)?;
 
                 let fx = self.fx.as_mut().unwrap();
-                fx.pre_process(&self.buffer, input_latency as u64)?;
+                fx.pre_process(&self.buffer, input_latency as u64)
+                    .map_err(AudioMixerError::AudioFXError)?;
 
                 fx.frame_available += input_latency as i64;
             }
@@ -345,7 +352,7 @@ impl AudioMixerInner {
         Ok(max_channel_seeked)
     }
 
-    fn compute_mixer_length(&mut self) -> Result<u64, String> {
+    fn compute_mixer_length(&mut self) -> Result<u64, AudioMixerError> {
         let mut max_length = 0;
         let mut has_infinite = false;
 
@@ -387,7 +394,7 @@ impl AudioMixerInner {
         channel: Arc<Mutex<AudioChannelInner>>,
         delay: Option<u64>,
         duration: Option<u64>,
-    ) -> Result<(), String> {
+    ) -> Result<(), AudioMixerError> {
         let entry = AudioChannelEntry {
             channel,
             delay,
@@ -405,7 +412,7 @@ impl AudioMixerInner {
         mixer: Arc<Mutex<AudioMixerInner>>,
         delay: Option<u64>,
         duration: Option<u64>,
-    ) -> Result<(), String> {
+    ) -> Result<(), AudioMixerError> {
         let entry = AudioMixerEntry {
             mixer,
             delay,

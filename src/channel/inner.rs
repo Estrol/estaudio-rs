@@ -1,5 +1,6 @@
 use super::AudioChannelDSPCallback;
 use crate::{
+    channel::AudioChannelError,
     device::audioreader::AudioReader,
     effects::{
         AudioFX, AudioPanner, AudioResampler, AudioSpatialization, AudioSpatializationListener,
@@ -15,6 +16,7 @@ use std::{
     time::Instant,
 };
 
+#[allow(dead_code)]
 pub(crate) struct AudioChannelInner {
     pub ref_id: usize,
     pub marked_as_deleted: bool,
@@ -44,6 +46,7 @@ unsafe impl Send for AudioChannelInner {}
 #[allow(clippy::undocumented_unsafe_blocks)]
 unsafe impl Sync for AudioChannelInner {}
 
+#[allow(dead_code)]
 impl AudioChannelInner {
     pub fn read_pcm_frames(
         &mut self,
@@ -51,7 +54,7 @@ impl AudioChannelInner {
         output: &mut [f32],
         temp: &mut [f32],
         frame_count: u64,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, AudioChannelError> {
         if !self.playing.load(Ordering::SeqCst) {
             return Ok(0);
         }
@@ -72,7 +75,10 @@ impl AudioChannelInner {
 
             let available_frames = self.reader.available_frames();
             if available_frames > 0 {
-                target_frame_count = self.reader.read(output, target_frame_count)?;
+                target_frame_count = self
+                    .reader
+                    .read(output, target_frame_count)
+                    .map_err(|e| AudioChannelError::AudioReaderError(e))?;
 
                 if target_frame_count >= available_frames {
                     fx.frame_available += fx.get_output_latency() as i64;
@@ -82,7 +88,8 @@ impl AudioChannelInner {
             }
 
             if fx.frame_available > 0 {
-                fx.process(output, target_frame_count, temp, readed_frame_count)?;
+                fx.process(output, target_frame_count, temp, readed_frame_count)
+                    .map_err(|e| AudioChannelError::AudioFXError(e))?;
 
                 fx.frame_available -= readed_frame_count as i64;
 
@@ -104,13 +111,17 @@ impl AudioChannelInner {
 
             frames_readed = readed_frame_count;
         } else {
-            frames_readed = self.reader.read(output, required_frame_count)?;
+            frames_readed = self
+                .reader
+                .read(output, required_frame_count)
+                .map_err(|e| AudioChannelError::AudioReaderError(e))?;
         }
 
         if !self.resampler.bypass_mode() {
-            let resampler_frame_count =
-                self.resampler
-                    .process(output, required_frame_count, temp, frame_count)?;
+            let resampler_frame_count = self
+                .resampler
+                .process(output, required_frame_count, temp, frame_count)
+                .map_err(|e| AudioChannelError::AudioResamplerError(e))?;
 
             utils::array_fast_copy_f32(
                 temp,
@@ -123,14 +134,21 @@ impl AudioChannelInner {
             frames_readed = resampler_frame_count;
         }
 
-        self.gainer.process(output, temp, frames_readed as u64)?;
-        self.panner.process(temp, output, frames_readed as u64)?;
+        self.gainer
+            .process(output, temp, frames_readed as u64)
+            .map_err(|e| AudioChannelError::AudioVolumeError(e))?;
+
+        self.panner
+            .process(temp, output, frames_readed as u64)
+            .map_err(|e| AudioChannelError::AudioPannerError(e))?;
 
         self.position.fetch_add(frames_readed, Ordering::SeqCst);
 
         if frames_readed < frame_count {
             if self.is_looping.load(Ordering::SeqCst) {
-                self.reader.seek(0)?;
+                self.reader
+                    .seek(0)
+                    .map_err(|e| AudioChannelError::AudioReaderError(e))?;
             } else {
                 self.playing.store(false, Ordering::SeqCst);
             }
@@ -143,7 +161,9 @@ impl AudioChannelInner {
 
         if let Some(spatializer) = &mut self.spatializer {
             if let Some(listener) = spatializer_listener {
-                spatializer.process(listener, output, temp, frames_readed)?;
+                spatializer
+                    .process(listener, output, temp, frames_readed)
+                    .map_err(|e| AudioChannelError::AudioSpatializationError(e))?;
 
                 utils::array_fast_copy_f32(
                     temp,
@@ -158,14 +178,16 @@ impl AudioChannelInner {
         return Ok(frames_readed);
     }
 
-    pub fn seek(&mut self, position: u64) -> Result<u64, String> {
+    pub fn seek(&mut self, position: u64) -> Result<u64, AudioChannelError> {
         if position >= self.reader.pcm_length {
-            return Err(format!("Position out of bounds: {}", position));
+            return Err(AudioChannelError::SeekOutOfBounds);
         }
 
         self.position.store(position, Ordering::SeqCst);
 
-        self.reader.seek(position)?;
+        self.reader
+            .seek(position)
+            .map_err(|e| AudioChannelError::AudioReaderError(e))?;
 
         if self.fx.is_some() {
             let fx = self.fx.as_mut().unwrap();
@@ -175,8 +197,12 @@ impl AudioChannelInner {
             if latency > 0 {
                 let mut output = vec![0.0f32; latency as usize * 2];
 
-                self.reader.read(&mut output, latency)?;
-                fx.pre_process(&output, latency)?;
+                self.reader
+                    .read(&mut output, latency)
+                    .map_err(|e| AudioChannelError::AudioReaderError(e))?;
+
+                fx.pre_process(&output, latency)
+                    .map_err(|e| AudioChannelError::AudioFXError(e))?;
             }
         }
 

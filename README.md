@@ -15,26 +15,7 @@ Supported out of the box:
 * ogg (opus) (unstable)
 
 ## Example
-```rs
-use estaudio::prelude*;
-
-fn main() {
-    let mut audio_device = AudioEngine::make_device()
-        .build()
-        .expect("Audio Device failed to created");
-
-    let channel = AudioEngine::make_channel(Some(&audio_device))
-        .file("./test.ogg")
-        .build()
-        .expect("Failed to create channel");
-
-    channel.play().expect("Failed to play channel");
-
-    while channel.is_playing() {
-        // Sleep thread here
-    }
-}
-```
+The examples were available at folder `Examples`, you can try run it with `cargo run --example NAME`.
 
 ## License
 MIT or Apache 2.0

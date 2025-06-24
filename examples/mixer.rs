@@ -1,27 +1,29 @@
-extern crate estaudioengine;
+extern crate est_audio;
 
-use estaudioengine::prelude::*;
+// use est_audio::prelude::*;
 
 fn main() {
-    let engine = AudioEngine::make_device(None)
+    let mut engine = est_audio::create_device(None)
         .build()
         .expect("Failed to create audio engine");
 
-    let channel = AudioEngine::make_channel(None)
+    let channel = est_audio::create_channel(None)
         .file("./assets/Example.ogg")
         .build()
         .expect("Failed to create audio channel");
 
-    let mixer = AudioEngine::make_mixer()
+    let mixer = est_audio::create_mixer(None)
         .channel(2)
         .sample_rate(44100)
         .build()
         .expect("Failed to create audio mixer");
 
-    engine.add_mixer(&mixer)
+    engine
+        .add_mixer(&mixer)
         .expect("Failed to add mixer to engine");
 
-    mixer.add_channel(&channel)
+    mixer
+        .add_channel(&channel)
         .expect("Failed to add channel to mixer");
 
     mixer.play().expect("Failed to play mixer");

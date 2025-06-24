@@ -5,11 +5,14 @@ mod spartilization_listener;
 mod spatialization;
 mod volume;
 
-pub use fx::AudioFX;
-pub use panner::AudioPanner;
-pub use resampler::AudioResampler;
-pub use spartilization_listener::{AudioSpartialListenerHandler, AudioSpatializationListener};
-pub use spatialization::{
-    AttenuationModel, AudioSpatialization, AudioSpatializationHandler, Positioning,
+pub use fx::{AudioFX, AudioFXError};
+pub use panner::{AudioPanner, AudioPannerError};
+pub use resampler::{AudioResampler, AudioResamplerError};
+pub use spartilization_listener::{
+    AudioSpartialListenerHandler, AudioSpatializationListener, AudioSpatializationListenerError,
 };
-pub use volume::AudioVolume;
+pub use spatialization::{
+    AttenuationModel, AudioSpatialization, AudioSpatializationError, AudioSpatializationHandler,
+    Positioning,
+};
+pub use volume::{AudioVolume, AudioVolumeError};

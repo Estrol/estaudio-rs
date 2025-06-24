@@ -1,8 +1,58 @@
 use miniaudio_sys::*;
 
-use crate::device::AudioDevice;
+use crate::{device::AudioDevice, utils};
 
 use super::spartilization_listener::AudioSpatializationListener;
+
+#[derive(Debug, Clone)]
+pub enum AudioSpatializationError {
+    InitializationFailed(i32), // Holds the error code from miniaudio
+    InvalidChannels(u32),      // Holds the invalid channel count
+    ProcessError(i32),         // Holds a custom error message for processing errors
+    OperationError(i32),       // Holds a custom error message for general operation errors
+    NotInitialized,            // Indicates that the spatializer was not initialized properly
+    ListenerNotInitialized,    // Indicates that the listener was not initialized properly
+}
+
+impl std::fmt::Display for AudioSpatializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioSpatializationError::InitializationFailed(code) => {
+                write!(
+                    f,
+                    "Initialization failed with error code: {} ({})",
+                    code,
+                    utils::ma_to_string_result(*code)
+                )
+            }
+            AudioSpatializationError::InvalidChannels(channels) => {
+                write!(f, "Invalid number of channels: {}", channels)
+            }
+            AudioSpatializationError::ProcessError(code) => {
+                write!(
+                    f,
+                    "Failed to process spatialization: {} ({})",
+                    code,
+                    utils::ma_to_string_result(*code)
+                )
+            }
+            AudioSpatializationError::OperationError(code) => {
+                write!(
+                    f,
+                    "Operation error: {} ({})",
+                    code,
+                    utils::ma_to_string_result(*code)
+                )
+            }
+            AudioSpatializationError::NotInitialized => {
+                write!(f, "Spatializer channel not initialized")
+            }
+            AudioSpatializationError::ListenerNotInitialized => {
+                write!(f, "Spatializer device listener not initialized")
+            }
+        }
+    }
+}
 
 pub struct AudioSpatialization {
     pub spatialization: Box<ma_spatializer>,
@@ -44,8 +94,9 @@ impl From<i32> for Positioning {
     }
 }
 
+#[allow(dead_code)]
 impl AudioSpatialization {
-    pub fn new(channels_in: u32, channels_out: u32) -> Result<Self, String> {
+    pub fn new(channels_in: u32, channels_out: u32) -> Result<Self, AudioSpatializationError> {
         unsafe {
             let mut spatializer = Box::<ma_spatializer>::new_uninit();
             let config = ma_spatializer_config_init(channels_in, channels_out);
@@ -54,7 +105,7 @@ impl AudioSpatialization {
                 ma_spatializer_init(&config, std::ptr::null_mut(), spatializer.as_mut_ptr());
 
             if result != 0 {
-                return Err(format!("Failed to initialize spatializer: {}", result));
+                return Err(AudioSpatializationError::InitializationFailed(result));
             }
 
             let spatializer = spatializer.assume_init();
@@ -71,7 +122,7 @@ impl AudioSpatialization {
         input: &[f32],
         output: &mut [f32],
         frame_count: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), AudioSpatializationError> {
         unsafe {
             let result = ma_spatializer_process_pcm_frames(
                 self.spatialization.as_mut(),
@@ -82,30 +133,30 @@ impl AudioSpatialization {
             );
 
             if result != 0 {
-                return Err(format!("Failed to process spatialization: {}", result));
+                return Err(AudioSpatializationError::ProcessError(result));
             }
 
             Ok(())
         }
     }
 
-    pub fn set_master_volume(&mut self, volume: f32) -> Result<(), String> {
+    pub fn set_master_volume(&mut self, volume: f32) -> Result<(), AudioSpatializationError> {
         unsafe {
             let result = ma_spatializer_set_master_volume(self.spatialization.as_mut(), volume);
             if result != 0 {
-                return Err(format!("Failed to set master volume: {}", result));
+                return Err(AudioSpatializationError::OperationError(result));
             }
             Ok(())
         }
     }
 
-    pub fn get_master_volume(&self) -> Result<f32, String> {
+    pub fn get_master_volume(&self) -> Result<f32, AudioSpatializationError> {
         unsafe {
             let mut volume: f32 = 0.0;
             let result =
                 ma_spatializer_get_master_volume(self.spatialization.as_ref(), &mut volume);
             if result != 0 {
-                return Err(format!("Failed to get master volume: {}", result));
+                return Err(AudioSpatializationError::OperationError(result));
             }
             Ok(volume)
         }
@@ -311,43 +362,104 @@ impl Drop for AudioSpatialization {
     }
 }
 
+/// A trait that defines methods for handling audio spatialization in 3D space.
+/// This includes setting and retrieving the position, velocity, direction, and
+/// other spatial properties of an audio source, as well as configuring
+/// attenuation models and other related parameters.
 pub trait AudioSpatializationHandler {
-    fn set_position(&mut self, x: f32, y: f32, z: f32) -> Result<(), String>;
-    fn get_position(&self) -> Result<(f32, f32, f32), String>;
-    fn set_velocity(&mut self, x: f32, y: f32, z: f32) -> Result<(), String>;
-    fn get_velocity(&self) -> Result<(f32, f32, f32), String>;
-    fn set_direction(&mut self, x: f32, y: f32, z: f32) -> Result<(), String>;
-    fn get_direction(&self) -> Result<(f32, f32, f32), String>;
-    fn set_doppler_factor(&mut self, doppler_factor: f32) -> Result<(), String>;
-    fn get_doppler_factor(&self) -> Result<f32, String>;
-    fn set_attenuation_model(&mut self, attenuation_model: AttenuationModel) -> Result<(), String>;
-    fn get_attenuation_model(&self) -> Result<AttenuationModel, String>;
-    fn set_positioning(&mut self, positioning: Positioning) -> Result<(), String>;
-    fn get_positioning(&self) -> Result<Positioning, String>;
-    fn set_rolloff(&mut self, rolloff: f32) -> Result<(), String>;
-    fn get_rolloff(&self) -> Result<f32, String>;
-    fn set_min_gain(&mut self, min_gain: f32) -> Result<(), String>;
-    fn get_min_gain(&self) -> Result<f32, String>;
-    fn set_max_gain(&mut self, max_gain: f32) -> Result<(), String>;
-    fn get_max_gain(&self) -> Result<f32, String>;
-    fn set_min_distance(&mut self, min_distance: f32) -> Result<(), String>;
-    fn get_min_distance(&self) -> Result<f32, String>;
-    fn set_max_distance(&mut self, max_distance: f32) -> Result<(), String>;
-    fn get_max_distance(&self) -> Result<f32, String>;
+    /// Set the position of the audio source in 3D space.
+    fn set_position(&mut self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationError>;
+
+    /// Get the position of the audio source in 3D space.
+    fn get_position(&self) -> Result<(f32, f32, f32), AudioSpatializationError>;
+
+    /// Set the velocity of the audio source in 3D space.
+    fn set_velocity(&mut self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationError>;
+
+    /// Get the velocity of the audio source in 3D space.
+    fn get_velocity(&self) -> Result<(f32, f32, f32), AudioSpatializationError>;
+
+    /// Set the direction of the audio source in 3D space.
+    fn set_direction(&mut self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationError>;
+
+    /// Get the direction of the audio source in 3D space.
+    fn get_direction(&self) -> Result<(f32, f32, f32), AudioSpatializationError>;
+
+    /// Set the Doppler factor for the audio source.
+    fn set_doppler_factor(&mut self, doppler_factor: f32) -> Result<(), AudioSpatializationError>;
+
+    /// Get the Doppler factor of the audio source.
+    fn get_doppler_factor(&self) -> Result<f32, AudioSpatializationError>;
+
+    /// Set the attenuation model for the audio source.
+    fn set_attenuation_model(
+        &mut self,
+        attenuation_model: AttenuationModel,
+    ) -> Result<(), AudioSpatializationError>;
+
+    /// Get the attenuation model of the audio source.
+    fn get_attenuation_model(&self) -> Result<AttenuationModel, AudioSpatializationError>;
+
+    /// Set the positioning mode for the audio source.
+    fn set_positioning(&mut self, positioning: Positioning)
+    -> Result<(), AudioSpatializationError>;
+
+    /// Get the positioning mode of the audio source.
+    fn get_positioning(&self) -> Result<Positioning, AudioSpatializationError>;
+
+    /// Set the rolloff factor for the audio source.
+    fn set_rolloff(&mut self, rolloff: f32) -> Result<(), AudioSpatializationError>;
+
+    /// Get the rolloff factor of the audio source.
+    fn get_rolloff(&self) -> Result<f32, AudioSpatializationError>;
+
+    /// Set the minimum gain for the audio source.
+    fn set_min_gain(&mut self, min_gain: f32) -> Result<(), AudioSpatializationError>;
+
+    /// Get the minimum gain of the audio source.
+    fn get_min_gain(&self) -> Result<f32, AudioSpatializationError>;
+
+    /// Set the maximum gain for the audio source.
+    fn set_max_gain(&mut self, max_gain: f32) -> Result<(), AudioSpatializationError>;
+
+    /// Get the maximum gain of the audio source.
+    fn get_max_gain(&self) -> Result<f32, AudioSpatializationError>;
+
+    /// Set the minimum distance for the audio source.
+    fn set_min_distance(&mut self, min_distance: f32) -> Result<(), AudioSpatializationError>;
+
+    /// Get the minimum distance of the audio source.
+    fn get_min_distance(&self) -> Result<f32, AudioSpatializationError>;
+
+    /// Set the maximum distance for the audio source.
+    fn set_max_distance(&mut self, max_distance: f32) -> Result<(), AudioSpatializationError>;
+
+    /// Get the maximum distance of the audio source.
+    fn get_max_distance(&self) -> Result<f32, AudioSpatializationError>;
+
+    /// Set the cone parameters for the audio source.
     fn set_cone(
         &mut self,
         inner_angle: f32,
         outer_angle: f32,
         outer_gain: f32,
-    ) -> Result<(), String>;
-    fn get_cone(&self) -> Result<(f32, f32, f32), String>;
+    ) -> Result<(), AudioSpatializationError>;
+
+    /// Get the cone parameters of the audio source.
+    fn get_cone(&self) -> Result<(f32, f32, f32), AudioSpatializationError>;
+
+    /// Set the directional attenuation factor for the audio source.
     fn set_directional_attenuation_factor(
         &mut self,
         directional_attenuation_factor: f32,
-    ) -> Result<(), String>;
-    fn get_directional_attenuation_factor(&self) -> Result<f32, String>;
+    ) -> Result<(), AudioSpatializationError>;
+
+    /// Get the directional attenuation factor of the audio source.
+    fn get_directional_attenuation_factor(&self) -> Result<f32, AudioSpatializationError>;
+
+    /// Get the relative position and direction of the audio source with respect to a listener.
     fn get_relative_position_and_direction(
         &self,
         listener: &AudioDevice,
-    ) -> Result<((f32, f32, f32), (f32, f32, f32)), String>;
+    ) -> Result<((f32, f32, f32), (f32, f32, f32)), AudioSpatializationError>;
 }

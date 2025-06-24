@@ -1,13 +1,11 @@
-extern crate estaudioengine;
-
-use estaudioengine::prelude::*;
+extern crate est_audio;
 
 fn main() {
-    let engine = AudioEngine::make_device(None)
+    let mut engine = est_audio::create_device(None)
         .build()
         .expect("Failed to create audio engine");
 
-    let channel = AudioEngine::make_channel(Some(&engine))
+    let mut channel = est_audio::create_channel(Some(&mut engine))
         .file("./assets/Example.ogg")
         .build()
         .expect("Failed to create audio channel");
