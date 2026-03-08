@@ -1,11 +1,11 @@
-# EstAudioEngine
-Yet another rust audio library built with miniaudio and signalsmitch-stretch.
+# EstAudio
+Yet another rust (and C API) audio library built with miniaudio and signalsmitch-stretch.
 
 ## Features
 * Easy to use without rust trait-bs thingy.
 * 3D supported with miniaudio's spatialization.
-* Timestretch and Pitchshifting support on device, mixer and channel level with signalsmitch-stretch.
-* Support DSP callbacks on device, channel and mixer level.
+* Timestretch and Pitchshifting support on mixer and channel level with signalsmitch-stretch.
+* Support playback, record and duplex on device level.
 
 ## Formats
 Supported out of the box:

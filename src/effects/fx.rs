@@ -1,11 +1,12 @@
-use signalsmith_stretch::Stretch;
+use astretch::Stretch;
+use thiserror::Error;
 
 #[derive(Debug)]
 pub struct AudioFX {
-    pub stretch: Stretch,
-    pub channels: u32,
-    pub sample_rate: u32,
-    pub frame_available: i64,
+    pub stretch: Stretch<f32>,
+    pub channels: usize,
+    pub sample_rate: f32,
+    pub frame_available: isize,
 
     pub tempo: f32,
     pub octave: f32,
@@ -13,16 +14,16 @@ pub struct AudioFX {
 
 #[allow(dead_code)]
 impl AudioFX {
-    pub fn new(channels: u32, sample_rate: u32) -> Result<Self, AudioFXError> {
+    pub fn new(channels: usize, sample_rate: f32) -> Result<Self, AudioFXError> {
         if channels < 1 || channels > 8 {
             return Err(AudioFXError::InvalidConfiguration);
         }
 
-        if sample_rate < 8000 || sample_rate > 192000 {
+        if sample_rate < 8000.0 || sample_rate > 192000.0 {
             return Err(AudioFXError::InvalidConfiguration);
         }
 
-        let stretch = Stretch::preset_default(channels, sample_rate);
+        let stretch = Stretch::new();
 
         Ok(Self {
             stretch,
@@ -34,15 +35,65 @@ impl AudioFX {
         })
     }
 
-    pub fn get_input_latency(&self) -> u32 {
-        self.stretch.input_latency() as u32
+    pub fn configure(&mut self, total_frame_count: usize) -> Result<usize, AudioFXError> {
+        if total_frame_count == 0 {
+            return Err(AudioFXError::InvalidConfiguration);
+        }
+
+        self.stretch.configure(
+            self.channels as i32,
+            self.sample_rate as i32,
+            self.sample_rate as i32,
+            true
+        );
+
+        // HACK: See (encoder/mod.rs#L130)
+        const PRESETS: [(f32, f32); 3] = [
+            (0.01f32, 0.004f32),
+            (0.001f32, 0.0004f32),
+            (0.0001f32, 0.00004f32),
+        ];
+
+        let mut seek_length = self.stretch.seek_length();
+        if total_frame_count < seek_length {
+            let sample_rate = self.sample_rate;
+
+            for (block, interval) in PRESETS {
+                if total_frame_count >= seek_length { 
+                    break;
+                }
+
+                self.stretch.configure(
+                    self.channels as i32,
+                    (sample_rate * block) as i32,
+                    (sample_rate * interval) as i32,
+                    true
+                );
+
+                seek_length = self.stretch.seek_length();
+            }
+
+            if total_frame_count < seek_length {
+                return Err(AudioFXError::InsufficientFrames);
+            }
+        }
+
+        Ok(seek_length as usize)
     }
 
-    pub fn get_output_latency(&self) -> u32 {
-        self.stretch.output_latency() as u32
+    pub fn get_input_latency(&self) -> usize {
+        self.stretch.input_latency() as usize
     }
 
-    pub fn get_required_input(&self, output_frame_count: u64) -> Result<u64, AudioFXError> {
+    pub fn get_output_latency(&self) -> usize {
+        self.stretch.output_latency() as usize
+    }
+
+    pub fn get_seek_length(&self) -> usize {
+        self.stretch.output_seek_length(self.tempo) as usize
+    }
+
+    pub fn get_required_input(&self, output_frame_count: usize) -> Result<usize, AudioFXError> {
         if output_frame_count == 0 {
             return Err(AudioFXError::InvalidFrameCount);
         }
@@ -51,12 +102,12 @@ impl AudioFX {
             return Ok(output_frame_count);
         }
 
-        let required_input = (output_frame_count as f32 * self.tempo) as u64;
+        let required_input = (output_frame_count as f32 * self.tempo).round() as usize;
 
         Ok(required_input)
     }
 
-    pub fn get_expected_output(&self, input_frame_count: u64) -> Result<u64, AudioFXError> {
+    pub fn get_expected_output(&self, input_frame_count: usize) -> Result<usize, AudioFXError> {
         if input_frame_count == 0 {
             return Err(AudioFXError::InvalidFrameCount);
         }
@@ -65,7 +116,7 @@ impl AudioFX {
             return Ok(input_frame_count);
         }
 
-        let output_frame_count = (input_frame_count as f32 / self.tempo) as u64;
+        let output_frame_count = (input_frame_count as f32 / self.tempo).round() as usize;
         if output_frame_count == 0 {
             return Err(AudioFXError::InvalidFrameCount);
         }
@@ -74,6 +125,10 @@ impl AudioFX {
     }
 
     pub fn set_octave(&mut self, octave: f32) -> Result<(), AudioFXError> {
+        if octave < 0.5 {
+            return Err(AudioFXError::InvalidOctave);
+        }
+
         let tonacity_limit = 4000.0 / self.sample_rate as f32;
 
         self.stretch
@@ -85,6 +140,14 @@ impl AudioFX {
     }
 
     pub fn set_tempo(&mut self, tempo: f32) -> Result<(), AudioFXError> {
+        if tempo < 0.5 {
+            return Err(AudioFXError::InvalidTempo);
+        }
+
+        if tempo > 2.0 {
+            return Err(AudioFXError::InvalidTempo);
+        }
+
         self.tempo = tempo;
         Ok(())
     }
@@ -93,141 +156,43 @@ impl AudioFX {
         self.tempo == 1.0
     }
 
-    pub fn pre_process(&mut self, input: &[f32], frame_count: u64) -> Result<(), AudioFXError> {
-        if input.len() < (frame_count * self.channels as u64) as usize {
-            return Err(AudioFXError::InvalidInputSize {
-                expected: (frame_count * self.channels as u64) as usize,
-                actual: input.len(),
-            });
-        }
-
-        self.stretch.reset();
-        self.stretch.process_raw(input, frame_count as usize, [], 0);
-
-        self.frame_available = frame_count as i64;
+    pub fn seek(&mut self, input: &[f32]) -> Result<(), AudioFXError> {
+        self.stretch.output_seek(&input);
 
         Ok(())
     }
 
-    pub fn process(
-        &mut self,
-        input: &[f32],
-        input_frame_count: u64,
-        output: &mut [f32],
-        output_frame_count: u64,
-    ) -> Result<(), AudioFXError> {
-        if input.len() < (input_frame_count * self.channels as u64) as usize {
-            return Err(AudioFXError::InvalidInputSize {
-                expected: (input_frame_count * self.channels as u64) as usize,
-                actual: input.len(),
-            });
+    pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), AudioFXError> {
+        let Ok(output_size) = self.get_expected_output(input.len() / self.channels as usize) else {
+            return Err(AudioFXError::InvalidFrameCount);
+        };
+
+        let expected_output_size = output_size as usize * self.channels as usize;
+        if output.len() < expected_output_size {
+            return Err(AudioFXError::InvalidFrameCount);
         }
 
-        if output.len() < (output_frame_count * self.channels as u64) as usize {
-            return Err(AudioFXError::InvalidOutputSize {
-                expected: (output_frame_count * self.channels as u64) as usize,
-                actual: output.len(),
-            });
-        }
+        let output = crate::macros::make_slice_mut!(output, output_size, self.channels);
 
-        self.stretch.process_raw(
-            input,
-            input_frame_count as usize,
-            output,
-            output_frame_count as usize,
-        );
+        self.stretch.process(input, output);
 
         Ok(())
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Error)]
 #[must_use]
 pub enum AudioFXError {
+    #[error("AudioFX is not enabled. Please enable it before using.")]
     NotEnabled,
+    #[error("Invalid configuration for AudioFX. Please check the parameters.")]
     InvalidConfiguration,
-    InvalidInputSize {
-        expected: usize,
-        actual: usize,
-    },
-    InvalidOutputSize {
-        expected: usize,
-        actual: usize,
-    },
-    BufferTooSmall {
-        buffer: &'static str, // "input" or "output"
-        expected: usize,
-        actual: usize,
-    },
+    #[error("Invalid frame count. Frame count must be greater than 0.")]
     InvalidFrameCount,
+    #[error("Invalid tempo. Tempo must be greater than 0.5 and less than 2.0.")]
     InvalidTempo,
+    #[error("Invalid octave. Octave must be greater than 0.5")]
     InvalidOctave,
-    LibraryError(String),
-    Other(String),
-}
-
-impl std::fmt::Display for AudioFXError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AudioFXError::NotEnabled => {
-                write!(f, "AudioFX is not enabled. Please enable it before using.")
-            }
-            AudioFXError::InvalidConfiguration => {
-                write!(
-                    f,
-                    "Invalid configuration for AudioFX. Please check the parameters."
-                )
-            }
-            AudioFXError::InvalidInputSize { expected, actual } => {
-                write!(
-                    f,
-                    "Input buffer size does not match the expected size. Expected: {}, Got: {}",
-                    expected, actual
-                )
-            }
-
-            AudioFXError::InvalidOutputSize { expected, actual } => {
-                write!(
-                    f,
-                    "Output buffer size does not match the expected size. Expected: {}, Got: {}",
-                    expected, actual
-                )
-            }
-
-            AudioFXError::InvalidFrameCount => {
-                write!(
-                    f,
-                    "Invalid frame count. Frame count must be greater than 0."
-                )
-            }
-
-            AudioFXError::BufferTooSmall {
-                buffer,
-                expected,
-                actual,
-            } => {
-                write!(
-                    f,
-                    "Buffer '{}' is too small. Expected: {}, Got: {}",
-                    buffer, expected, actual
-                )
-            }
-
-            AudioFXError::InvalidTempo => {
-                write!(f, "Invalid tempo. Tempo must be greater than 0.")
-            }
-
-            AudioFXError::InvalidOctave => {
-                write!(f, "Invalid octave. Octave must be greater than 0.")
-            }
-
-            AudioFXError::LibraryError(msg) => {
-                write!(f, "Library error: {}", msg)
-            }
-
-            AudioFXError::Other(msg) => {
-                write!(f, "An error occurred: {}", msg)
-            }
-        }
-    }
+    #[error("Insufficient required frames, make sure audio has enough frames for the current tempo setting, tried 3 presets but still not enough frames.")]
+    InsufficientFrames,
 }

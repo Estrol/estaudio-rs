@@ -1,43 +1,25 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::Ordering};
+
+pub(crate) mod sampelchannel;
+pub(crate) mod sampleinner;
 
 use crate::{
-    channel::{AudioChannel, AudioChannelError},
-    device::{
-        AudioAttributes, AudioDevice, AudioPropertyError, AudioPropertyHandler,
-        audioreader::{AudioReader, AudioReaderError},
+    BufferInfoOwned,
+    audioreader::cache::AudioCache,
+    device::Device,
+    effects::AudioFXError,
+    misc::{
+        audioattributes::AudioAttributes,
+        audiopropertyhandler::{PropertyError, PropertyHandler},
     },
-    effects::{AudioFXError, AudioPannerError},
+    sample::sampleinner::SampleChannelStatus,
 };
 
-#[derive(Debug, Clone)]
-pub enum AudioSampleError {
-    FileNotFound(String),
-    InvalidChannels(u32),
-    InvalidSampleRate(u32),
-    AudioReaderError(AudioReaderError),
-    AudioPannerError(AudioPannerError),
-    AudioChannelError(AudioChannelError),
-    AudioPropertyError(AudioPropertyError),
-}
-
-impl std::fmt::Display for AudioSampleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AudioSampleError::FileNotFound(file) => write!(f, "Audio file not found: {}", file),
-            AudioSampleError::InvalidChannels(channels) => {
-                write!(f, "Invalid number of channels: {}", channels)
-            }
-            AudioSampleError::InvalidSampleRate(rate) => write!(f, "Invalid sample rate: {}", rate),
-            AudioSampleError::AudioReaderError(e) => write!(f, "Audio reader error: {}", e),
-            AudioSampleError::AudioPannerError(e) => write!(f, "Audio panner error: {}", e),
-            AudioSampleError::AudioChannelError(e) => write!(f, "Audio channel error: {}", e),
-            AudioSampleError::AudioPropertyError(e) => write!(f, "Audio property error: {}", e),
-        }
-    }
-}
+pub use sampelchannel::SampleChannel;
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
-pub struct AudioSampleAttributes {
+pub struct SampleAttributes {
     pub enable_fx: bool,
     pub enable_spatialization: bool,
 
@@ -49,7 +31,7 @@ pub struct AudioSampleAttributes {
     pub fx_pitch: f32,
 }
 
-impl Default for AudioSampleAttributes {
+impl Default for SampleAttributes {
     fn default() -> Self {
         Self {
             enable_fx: false,
@@ -63,147 +45,175 @@ impl Default for AudioSampleAttributes {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct AudioSample {
-    pub(crate) buffer: Vec<f32>,
-    pub(crate) pcm_length: u64,
-    pub(crate) sample_rate: u32,
-    pub(crate) channels: u32,
-    pub(crate) attributes: Arc<Mutex<AudioSampleAttributes>>,
+#[derive(Default)]
+pub struct SampleInfo<'a> {
+    pub source: crate::Source<'a>,
+    pub sample_rate: Option<f32>,
+    pub channels: Option<usize>,
 }
 
-impl AudioSample {
-    pub(crate) fn load(file_path: &str) -> Result<Self, AudioSampleError> {
-        let mut audioreader =
-            AudioReader::load(file_path).map_err(AudioSampleError::AudioReaderError)?;
+#[derive(Default, Clone)]
+pub struct SampleChannelInfo {
+    pub sample_rate: Option<f32>,
+    pub channels: Option<usize>,
+}
 
-        let mut buffer = vec![0.0; audioreader.pcm_length as usize * audioreader.channels as usize];
-        audioreader
-            .read(&mut buffer, audioreader.pcm_length)
-            .map_err(AudioSampleError::AudioReaderError)?;
+#[derive(Debug, Clone)]
+pub struct Sample {
+    pub(crate) cache: Option<Arc<AudioCache>>,
+    pub(crate) buffer: Option<BufferInfoOwned>,
+    #[allow(dead_code)]
+    pub(crate) pcm_length: usize,
+    pub(crate) sample_rate: f32,
+    pub(crate) channels: usize,
+    pub(crate) attributes: Arc<Mutex<SampleAttributes>>,
+    pub(crate) handles: Vec<SampleChannel>,
+}
 
-        let mut attributes = AudioSampleAttributes::default();
-        attributes.sample_rate = audioreader.sample_rate as f32;
+impl Sample {
+    pub(crate) fn new(info: SampleInfo) -> Result<Self, SampleError> {
+        let (cache, buffer_info) = info.source.into_buffer();
+
+        let (cache, buffer, pcm_length, sample_rate, channels) = match buffer_info {
+            Some(buffer_info) => {
+                let channels = buffer_info.channels;
+                let sample_rate = buffer_info.sample_rate;
+                let pcm_length = buffer_info.data.len() / channels;
+
+                (
+                    None::<Arc<AudioCache>>,
+                    Some(buffer_info.into_owned()),
+                    pcm_length,
+                    sample_rate,
+                    channels,
+                )
+            }
+            None => {
+                let Some(cache) = cache else {
+                    return Err(SampleError::InvalidOperation(
+                        "No valid audio source provided",
+                    ));
+                };
+
+                let sample_rate = cache.sample_rate;
+                let channels = cache.channel_count;
+                let pcm_length = cache.length_in_frames;
+
+                (Some(cache.clone()), None, pcm_length, sample_rate, channels)
+            }
+        };
+
+        let attributes = Arc::new(Mutex::new(SampleAttributes {
+            sample_rate,
+            ..Default::default()
+        }));
+
+        let handles = vec![];
 
         Ok(Self {
+            cache,
             buffer,
-            pcm_length: audioreader.pcm_length,
-            sample_rate: audioreader.sample_rate,
-            channels: audioreader.channels,
-            attributes: Arc::new(Mutex::new(attributes)),
-        })
-    }
-
-    pub(crate) fn load_file_buffer(buffer: &[u8]) -> Result<Self, AudioSampleError> {
-        let mut audioreader =
-            AudioReader::load_file_buffer(buffer).map_err(AudioSampleError::AudioReaderError)?;
-
-        let mut audio_buffer =
-            vec![0.0; audioreader.pcm_length as usize * audioreader.channels as usize];
-        audioreader
-            .read(&mut audio_buffer, audioreader.pcm_length)
-            .map_err(AudioSampleError::AudioReaderError)?;
-
-        let mut attributes = AudioSampleAttributes::default();
-        attributes.sample_rate = audioreader.sample_rate as f32;
-
-        Ok(Self {
-            buffer: audio_buffer,
-            pcm_length: audioreader.pcm_length,
-            sample_rate: audioreader.sample_rate,
-            channels: audioreader.channels,
-            attributes: Arc::new(Mutex::new(attributes)),
-        })
-    }
-
-    pub(crate) fn load_audio_buffer(
-        buffer: &[f32],
-        pcm_length: u64,
-        sample_rate: u32,
-        channels: u32,
-    ) -> Result<Self, AudioSampleError> {
-        if channels < 1 || channels > 8 {
-            return Err(AudioSampleError::InvalidChannels(channels));
-        }
-
-        if sample_rate < 8000 || sample_rate > 192000 {
-            return Err(AudioSampleError::InvalidSampleRate(sample_rate));
-        }
-
-        let mut attributes = AudioSampleAttributes::default();
-        attributes.sample_rate = sample_rate as f32;
-
-        Ok(Self {
-            buffer: buffer.to_vec(),
             pcm_length,
             sample_rate,
             channels,
-            attributes: Arc::new(Mutex::new(attributes)),
+            handles,
+            attributes,
         })
     }
 
-    pub fn play(&self, device: &AudioDevice) -> Result<(), AudioSampleError> {
-        let mut channel = AudioChannel::new_audio_buffer(
-            &self.buffer,
-            self.pcm_length,
-            self.sample_rate,
-            self.channels,
-        )
-        .map_err(AudioSampleError::AudioChannelError)?;
+    pub fn get_channel(
+        &mut self,
+        info: Option<SampleChannelInfo>,
+    ) -> Result<SampleChannel, SampleError> {
+        let Ok(channel) = self.get_channels(1, info) else {
+            return Err(SampleError::NoAvailableChannels);
+        };
 
-        channel
-            .attach(device)
-            .map_err(AudioSampleError::AudioChannelError)?;
-
-        self.apply_attributes(&channel)
-            .map_err(AudioSampleError::AudioPropertyError)?;
-
-        channel
-            .play()
-            .map_err(AudioSampleError::AudioChannelError)?;
-
-        Ok(())
+        Ok(channel.into_iter().next().unwrap())
     }
 
     pub fn get_channels(
-        &self,
-        device: &AudioDevice,
-        size: u32,
-    ) -> Result<Vec<AudioChannel>, AudioSampleError> {
+        &mut self,
+        size: usize,
+        info: Option<SampleChannelInfo>,
+    ) -> Result<Vec<SampleChannel>, SampleError> {
         let mut channels = vec![];
 
         for _ in 0..size {
-            let mut channel = AudioChannel::new_audio_buffer(
-                &self.buffer,
-                self.pcm_length,
-                self.sample_rate,
-                self.channels,
-            )
-            .map_err(|e| AudioSampleError::AudioChannelError(e))?;
+            let mut channel = self.get_unused_channel();
 
-            channel
-                .attach(&device)
-                .map_err(|e| AudioSampleError::AudioChannelError(e))?;
+            if channel.is_none() {
+                let handle = SampleChannel::new(
+                    &self.cache,
+                    &self.buffer.as_ref().map(|e| e.get_ref()),
+                    self.channels,
+                    self.sample_rate,
+                ).map_err(SampleError::from_other)?;
 
-            self.apply_attributes(&channel)
-                .map_err(|e| AudioSampleError::AudioPropertyError(e))?;
+                self.handles.push(handle.clone());
+                channel = Some(handle);
+            }
 
-            channels.push(channel);
+            if let Some(mut ch) = channel {
+                ch.reset(&info);
+
+                channels.push(ch);
+            }
+        }
+
+        if channels.is_empty() {
+            return Err(SampleError::NoAvailableChannels);
         }
 
         Ok(channels)
     }
 
-    fn apply_attributes(&self, channel: &AudioChannel) -> Result<(), AudioPropertyError> {
+    pub fn play(&mut self, device: &mut Device) -> Result<SampleChannel, SampleError> {
+        self.play_ex(device, None)
+    }
+
+    pub fn play_ex(
+        &mut self,
+        device: &mut Device,
+        info: Option<SampleChannelInfo>,
+    ) -> Result<SampleChannel, SampleError> {
+        let Ok(mut channel) = self.get_channel(info) else {
+            return Err(SampleError::NoAvailableChannels);
+        };
+
+        self.apply_attributes(&mut channel)
+            .map_err(SampleError::from_other)?;
+        channel.play(device).map_err(SampleError::from_other)?;
+
+        Ok(channel)
+    }
+
+    fn get_unused_channel(&mut self) -> Option<SampleChannel> {
+        for channel in &self.handles {
+            if channel.get_inner_counter() == 1 && channel.is_finished() {
+                let mut handle = channel.inner.lock().unwrap();
+                handle.seek(0).unwrap();
+
+                handle
+                    .status
+                    .store(SampleChannelStatus::NotStarted, Ordering::Relaxed);
+                return Some(channel.clone());
+            }
+        }
+
+        None
+    }
+
+    fn apply_attributes(&self, channel: &mut SampleChannel) -> Result<(), PropertyError> {
         let attributes = self.attributes.lock().unwrap();
 
         channel.set_attribute_f32(AudioAttributes::Volume, attributes.volume)?;
         channel.set_attribute_f32(AudioAttributes::Pan, attributes.pan)?;
         channel.set_attribute_f32(AudioAttributes::SampleRate, attributes.sample_rate)?;
 
-        channel.set_attribute_bool(AudioAttributes::AudioFX, attributes.enable_fx)?;
+        channel.set_attribute_bool(AudioAttributes::FXEnabled, attributes.enable_fx)?;
         channel.set_attribute_bool(
-            AudioAttributes::AudioSpatialization,
+            AudioAttributes::SpatializationEnabled,
             attributes.enable_spatialization,
         )?;
 
@@ -216,8 +226,8 @@ impl AudioSample {
     }
 }
 
-impl AudioPropertyHandler for AudioSample {
-    fn get_attribute_f32(&self, _type: AudioAttributes) -> Result<f32, AudioPropertyError> {
+impl PropertyHandler for Sample {
+    fn get_attribute_f32(&self, _type: AudioAttributes) -> Result<f32, PropertyError> {
         let attributes = self.attributes.lock().unwrap();
 
         match _type {
@@ -226,29 +236,27 @@ impl AudioPropertyHandler for AudioSample {
             AudioAttributes::Pan => Ok(attributes.pan),
             AudioAttributes::FXPitch => {
                 if !attributes.enable_fx {
-                    return Err(AudioPropertyError::AudioFXError(AudioFXError::NotEnabled));
+                    return Err(PropertyError::from_other(AudioFXError::NotEnabled));
                 }
 
                 Ok(attributes.fx_pitch)
             }
             AudioAttributes::FXTempo => {
                 if !attributes.enable_fx {
-                    return Err(AudioPropertyError::AudioFXError(AudioFXError::NotEnabled));
+                    return Err(PropertyError::from_other(AudioFXError::NotEnabled));
                 }
 
                 Ok(attributes.fx_tempo)
             }
-            _ => Err(AudioPropertyError::UnsupportedAttribute(
-                "Unknown attribute",
-            )),
+            _ => Err(PropertyError::UnsupportedAttribute("Unknown attribute")),
         }
     }
 
     fn set_attribute_f32(
-        &self,
+        &mut self,
         _type: AudioAttributes,
         _value: f32,
-    ) -> Result<(), AudioPropertyError> {
+    ) -> Result<(), PropertyError> {
         let mut attributes = self.attributes.lock().unwrap();
 
         match _type {
@@ -266,7 +274,7 @@ impl AudioPropertyHandler for AudioSample {
             }
             AudioAttributes::FXPitch => {
                 if !attributes.enable_fx {
-                    return Err(AudioPropertyError::AudioFXError(AudioFXError::NotEnabled));
+                    return Err(PropertyError::from_other(AudioFXError::NotEnabled));
                 }
 
                 attributes.fx_pitch = _value;
@@ -274,49 +282,71 @@ impl AudioPropertyHandler for AudioSample {
             }
             AudioAttributes::FXTempo => {
                 if !attributes.enable_fx {
-                    return Err(AudioPropertyError::AudioFXError(AudioFXError::NotEnabled));
+                    return Err(PropertyError::from_other(AudioFXError::NotEnabled));
                 }
 
                 attributes.fx_tempo = _value;
                 Ok(())
             }
-            _ => Err(AudioPropertyError::UnsupportedAttribute(
-                "Unknown attribute",
-            )),
+            _ => Err(PropertyError::UnsupportedAttribute("Unknown attribute")),
         }
     }
 
-    fn get_attribute_bool(&self, _type: AudioAttributes) -> Result<bool, AudioPropertyError> {
+    fn get_attribute_bool(&self, _type: AudioAttributes) -> Result<bool, PropertyError> {
         let attributes = self.attributes.lock().unwrap();
 
         match _type {
-            AudioAttributes::AudioFX => Ok(attributes.enable_fx),
-            AudioAttributes::AudioSpatialization => Ok(attributes.enable_spatialization),
-            _ => Err(AudioPropertyError::UnsupportedAttribute(
-                "Unknown attribute",
-            )),
+            AudioAttributes::FXEnabled => Ok(attributes.enable_fx),
+            AudioAttributes::SpatializationEnabled => Ok(attributes.enable_spatialization),
+            _ => Err(PropertyError::UnsupportedAttribute("Unknown attribute")),
         }
     }
 
     fn set_attribute_bool(
-        &self,
+        &mut self,
         _type: AudioAttributes,
         _value: bool,
-    ) -> Result<(), AudioPropertyError> {
+    ) -> Result<(), PropertyError> {
         let mut attributes = self.attributes.lock().unwrap();
 
         match _type {
-            AudioAttributes::AudioFX => {
+            AudioAttributes::FXEnabled => {
                 attributes.enable_fx = _value;
                 Ok(())
             }
-            AudioAttributes::AudioSpatialization => {
+            AudioAttributes::SpatializationEnabled => {
                 attributes.enable_spatialization = _value;
                 Ok(())
             }
-            _ => Err(AudioPropertyError::UnsupportedAttribute(
-                "Unknown attribute",
-            )),
+            _ => Err(PropertyError::UnsupportedAttribute("Unknown attribute")),
         }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SampleError {
+    #[error("{0}")]
+    InvalidOperation(&'static str),
+    #[error("File not found: {0}")]
+    FileNotFound(String),
+    #[error("Invalid channel count: {0}")]
+    InvalidChannels(u32),
+    #[error("Invalid sample rate: {0}")]
+    InvalidSampleRate(u32),
+    #[error("Sample already in use by another device with ref id: {0}")]
+    InvalidDeviceRefId(u32),
+    #[error("Seek operation failed")]
+    SeekFailed,
+    #[error("No available channels to play the sample")]
+    NoAvailableChannels,
+    #[error("Failed to lock Sample")]
+    LockFailed,
+    #[error("{0}")]
+    Other(Box<dyn std::error::Error>),
+}
+
+impl SampleError {
+    pub fn from_other<E: std::error::Error + 'static>(error: E) -> Self {
+        SampleError::Other(Box::new(error))
     }
 }

@@ -1,335 +1,239 @@
-use std::sync::{Arc, Mutex};
+use once_cell::sync::Lazy;
+use std::sync::{Arc, Mutex, Weak, mpsc::Sender};
+use thiserror::Error;
 
-use inner::AudioDeviceInner;
+use inner::DeviceInner;
 
 use crate::{
-    channel::{AudioChannel, AudioChannelError},
-    effects::{
-        AudioFX, AudioFXError, AudioPannerError, AudioResamplerError, AudioSpartialListenerHandler,
-        AudioSpatializationError, AudioSpatializationListener, AudioSpatializationListenerError,
-        AudioVolumeError,
-    },
-    mixer::AudioMixer,
-    utils::{self, MutexPoison},
+    context::{AudioHardwareInfo, DeviceType}, effects::{
+        SpartialListenerHandler, SpatializationListener, SpatializationListenerError,
+    }, math::Vector3, misc::{
+        audioattributes::AudioAttributes,
+        audiopropertyhandler::{PropertyError, PropertyHandler},
+    }, mixer::inner::MixerChannel, sample::sampleinner::SampleChannelHandle as SampleChannel, track::inner::TrackChannel, utils
 };
 
-pub(crate) mod audioreader;
-pub(crate) mod context;
 pub(crate) mod inner;
 
-use context::*;
-
-pub type AudioDeviceDSPCallback = fn(buffer: &[f32], frame_count: u64);
-
-pub enum AudioAttributes {
-    Unknown,
-    /// The sample rate of the audio channel, device or mixer.
-    SampleRate,
-    /// The volume of the audio channel, device or mixer.
-    Volume,
-    /// The pan of the audio channel, device or mixer.
-    Pan,
-    /// The pitch of the audio channel. \
-    /// This require the [AudioAttributes::AudioFX] on [AudioDevice] to be enabled.
-    FXPitch,
-    /// The tempo of the audio channel. \
-    /// This require the [AudioAttributes::AudioFX] on [AudioDevice] to be enabled.
-    FXTempo,
-    /// Enable or disable the AudioFX used for Tempo and Pitch on the audio channel, device or mixer.
-    AudioFX,
-    /// Enable or disable the AudioSpatialization used for 3D Audio on the audio channel, device or mixer.
-    AudioSpatialization,
-}
-
-impl AudioAttributes {
-    pub fn from(name: &str) -> Self {
-        match name {
-            "SampleRate" => AudioAttributes::SampleRate,
-            "Volume" => AudioAttributes::Volume,
-            "Pan" => AudioAttributes::Pan,
-            "FXPitch" => AudioAttributes::FXPitch,
-            "FXTempo" => AudioAttributes::FXTempo,
-            _ => AudioAttributes::Unknown,
-        }
-    }
-
-    pub fn to_string(&self) -> String {
-        match self {
-            AudioAttributes::SampleRate => "SampleRate".to_string(),
-            AudioAttributes::Volume => "Volume".to_string(),
-            AudioAttributes::Pan => "Pan".to_string(),
-            AudioAttributes::FXPitch => "FXPitch".to_string(),
-            AudioAttributes::FXTempo => "FXTempo".to_string(),
-            AudioAttributes::AudioFX => "AudioFX".to_string(),
-            AudioAttributes::AudioSpatialization => "AudioSpatialization".to_string(),
-            AudioAttributes::Unknown => "Unknown".to_string(),
-        }
-    }
-}
-
-pub trait AudioPropertyHandler {
-    /// Get the [AudioAttributes] value (f32) of the [AudioChannel], [AudioDevice] or [AudioMixer].
-    fn get_attribute_f32(&self, _type: AudioAttributes) -> Result<f32, AudioPropertyError>;
-    /// Set the [AudioAttributes] value (f32) of the [AudioChannel], [AudioDevice] or [AudioMixer].
-    fn set_attribute_f32(
-        &self,
-        _type: AudioAttributes,
-        _value: f32,
-    ) -> Result<(), AudioPropertyError>;
-    /// Get the [AudioAttributes] value (bool) of the [AudioChannel], [AudioDevice] or [AudioMixer].
-    fn get_attribute_bool(&self, _type: AudioAttributes) -> Result<bool, AudioPropertyError>;
-    /// Set the [AudioAttributes] value (bool) of the [AudioChannel], [AudioDevice] or [AudioMixer].
-    fn set_attribute_bool(
-        &self,
-        _type: AudioAttributes,
-        _value: bool,
-    ) -> Result<(), AudioPropertyError>;
-}
-
-#[derive(Debug, Clone)]
-pub enum AudioPropertyError {
-    UnsupportedAttribute(&'static str),
-    AudioFXError(AudioFXError),
-    SpatializationListenerError(AudioSpatializationListenerError),
-    AudioChannelError(AudioChannelError),
-    AudioSpatializationListenerError(AudioSpatializationListenerError),
-    AudioSpatializationError(AudioSpatializationError),
-}
-
-impl std::fmt::Display for AudioPropertyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AudioPropertyError::UnsupportedAttribute(attr) => {
-                write!(f, "Unsupported attribute: {}", attr)
-            }
-            AudioPropertyError::AudioFXError(e) => write!(f, "AudioFX error: {}", e),
-            AudioPropertyError::SpatializationListenerError(e) => {
-                write!(f, "Spatialization listener error: {}", e)
-            }
-            AudioPropertyError::AudioChannelError(e) => write!(f, "Audio channel error: {}", e),
-            AudioPropertyError::AudioSpatializationListenerError(e) => {
-                write!(f, "Audio spatialization listener error: {}", e)
-            }
-            AudioPropertyError::AudioSpatializationError(e) => {
-                write!(f, "Audio spatialization error: {}", e)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum AudioDeviceError {
+#[derive(Debug, Error)]
+pub enum DeviceError {
+    #[error("Audio device initialization failed with code: {}, {}", .0, self.ma_result_to_str())]
     InitializationError(i32),
+    #[error("Invalid number of channels")]
     InvalidChannels,
+    #[error("Invalid sample rate")]
     InvalidSampleRate,
+    #[error("Invalid operation with code: {}, {}", .0, self.ma_result_to_str())]
     InvalidOperation(i32),
+    #[error("Audio channel with reference id {0} not found")]
     ChannelNotFound(usize),
+    #[error("Audio mixer with reference id {0} not found")]
     MixerNotFound(usize),
+    #[error("Audio channel with reference id {0} already exists")]
     ChannelAlreadyExists(usize),
+    #[error("Audio mixer with reference id {0} already exists")]
     MixerAlreadyExists(usize),
-    AudioChannelError(AudioChannelError),
-    AudioContextError(AudioContextError),
-    AudioSpatializationListenerError(AudioSpatializationListenerError),
-    AudioFXError(AudioFXError),
-    AudioVolumeError(AudioVolumeError),
-    AudioPannerError(AudioPannerError),
-    AudioResamplerError(AudioResamplerError),
-    AudioPropertyError(AudioPropertyError),
+    #[error("Unsupported (or mismatched) selected hardware device")]
+    UnsupportedHardwareDevice,
+    #[error("Failed to send audio handle to audio thread")]
+    SendAudioHandleFailed,
+    #[error("{0}")]
+    Other(Box<dyn std::error::Error + Send + 'static>), // Wraps other errors
 }
 
-impl std::fmt::Display for AudioDeviceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl DeviceError {
+    pub fn from_other<E: std::error::Error + Send + 'static>(error: E) -> Self {
+        DeviceError::Other(Box::new(error))
+    }
+
+    pub fn ma_result_to_str(&self) -> &str {
         match self {
-            AudioDeviceError::InitializationError(code) => write!(
-                f,
-                "Failed to initialize audio device: {} ({})",
-                code,
-                utils::ma_to_string_result(*code)
-            ),
-            AudioDeviceError::InvalidChannels => write!(f, "Invalid number of channels"),
-            AudioDeviceError::InvalidSampleRate => write!(f, "Invalid sample rate"),
-            AudioDeviceError::InvalidOperation(code) => write!(
-                f,
-                "Invalid operation with code: {} ({})",
-                code,
-                utils::ma_to_string_result(*code)
-            ),
-            AudioDeviceError::ChannelNotFound(ref_id) => {
-                write!(f, "Audio channel with reference id {} not found", ref_id)
-            }
-            AudioDeviceError::MixerNotFound(ref_id) => {
-                write!(f, "Audio mixer with reference id {} not found", ref_id)
-            }
-            AudioDeviceError::ChannelAlreadyExists(ref_id) => write!(
-                f,
-                "Audio channel with reference id {} already exists",
-                ref_id
-            ),
-            AudioDeviceError::MixerAlreadyExists(ref_id) => {
-                write!(f, "Audio mixer with reference id {} already exists", ref_id)
-            }
-            AudioDeviceError::AudioChannelError(e) => write!(f, "Audio channel error: {}", e),
-            AudioDeviceError::AudioContextError(e) => write!(f, "Audio context error: {}", e),
-            AudioDeviceError::AudioSpatializationListenerError(e) => {
-                write!(f, "Audio spatialization listener error: {}", e)
-            }
-            AudioDeviceError::AudioFXError(e) => write!(f, "Audio FX error: {}", e),
-            AudioDeviceError::AudioVolumeError(e) => write!(f, "Audio volume error: {}", e),
-            AudioDeviceError::AudioPannerError(e) => write!(f, "Audio panner error: {}", e),
-            AudioDeviceError::AudioResamplerError(e) => write!(f, "Audio resampler error: {}", e),
-            AudioDeviceError::AudioPropertyError(e) => write!(f, "Audio property error: {}", e),
+            DeviceError::InitializationError(code)
+            | DeviceError::InvalidOperation(code) => utils::ma_to_string_result(*code),
+            _ => "N/A",
         }
     }
+}
+
+pub(crate) enum AudioHandle {
+    Track(Weak<Mutex<TrackChannel>>),
+    Sample(Weak<Mutex<SampleChannel>>),
+    Mixer(Weak<Mutex<MixerChannel>>),
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct DeviceInfo<'a> {
+    pub ty: DeviceType,
+    pub channel: usize,
+    pub sample_rate: f32,
+    pub input: Option<&'a AudioHardwareInfo>,
+    pub output: Option<&'a AudioHardwareInfo>,
 }
 
 /// A hardware audio device, used to play audio comes from Channel and Mixer.
-pub struct AudioDevice {
-    pub(crate) inner: Arc<Mutex<Box<AudioDeviceInner>>>,
+pub struct Device {
+    pub(crate) device_ref_id: u32,
+    pub(crate) inner: Arc<Mutex<Box<DeviceInner>>>,
+    pub(crate) sender: Sender<AudioHandle>,
 
     // Used for lifetime management of the hardware context
     #[allow(dead_code)]
-    pub(crate) hardware: Option<AudioHardwareInfo>,
+    pub(crate) output: Option<AudioHardwareInfo>,
+    #[allow(dead_code)]
+    pub(crate) input: Option<AudioHardwareInfo>,
 }
 
-impl AudioDevice {
-    pub(crate) fn enumerable() -> Result<Vec<AudioHardwareInfo>, AudioDeviceError> {
-        let context = AudioContext::new().map_err(AudioDeviceError::AudioContextError)?;
+static DEVICE_ID_COUNTER: Lazy<Mutex<u32>> = Lazy::new(|| Mutex::new(0));
 
-        let devices = enumerable(context).map_err(AudioDeviceError::AudioContextError)?;
+fn generate_device_id() -> u32 {
+    let mut counter = DEVICE_ID_COUNTER.lock().unwrap();
+    *counter += 1;
+    *counter
+}
 
-        Ok(devices)
-    }
+impl Device {
+    pub(crate) fn new(config: DeviceInfo) -> Result<Self, DeviceError> {
+        let input = config.input.cloned();
+        let output = config.output.cloned();
 
-    pub(crate) fn new(
-        hardware: Option<&AudioHardwareInfo>,
-        channels: u32,
-        sample_rate: u32,
-    ) -> Result<Self, AudioDeviceError> {
-        let inner = AudioDeviceInner::new(hardware, channels, sample_rate)?;
+        let result = DeviceInner::new(config);
+        if let Err(e) = result {
+            return Err(e);
+        }
 
-        Ok({
-            AudioDevice {
-                inner: Arc::new(Mutex::new(inner)),
-                hardware: hardware.cloned(),
-            }
+        let (inner, sender) = result.unwrap();
+
+        let new_id = generate_device_id();
+
+        Ok(Device {
+            device_ref_id: new_id,
+            inner: Arc::new(Mutex::new(inner)),
+            sender,
+            input,
+            output,
         })
     }
 
-    /// Add [AudioChannel] to the device.
-    pub fn add_channel(&mut self, channel: &AudioChannel) -> Result<(), AudioDeviceError> {
-        let mut inner = self.inner.lock_poison();
-        inner.add_channel(channel.inner.clone())?;
+    pub fn start(&mut self) -> Result<(), DeviceError> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return Err(DeviceError::InvalidOperation(-1)); // Use a custom error code for lock failure
+        };
+
+        inner.start()
+    }
+
+    pub fn stop(&mut self) -> Result<(), DeviceError> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return Err(DeviceError::InvalidOperation(-1)); // Use a custom error code for lock failure
+        };
+
+        inner.stop()
+    }
+
+    /// Set callback for both input and output. If you want to set them separately, use set_input_callback and set_output_callback instead.
+    pub fn set_callback<F>(&mut self, callback: Option<F>) -> Result<(), DeviceError>
+    where
+        F: FnMut(&[f32], &mut [f32]) + Send + 'static,
+    {
+        let Ok(mut inner) = self.inner.lock() else {
+            return Err(DeviceError::InvalidOperation(-1)); // Use a custom error code for lock failure
+        };
+
+        inner.set_callback(callback)
+    }
+
+    /// Set callback for input only. If you want to set both input and output callback at the same time, use set_callback instead.
+    pub fn set_input_callback<F>(&mut self, callback: Option<F>) -> Result<(), DeviceError>
+    where
+        F: FnMut(&[f32]) + Send + 'static,
+    {
+        let Ok(mut inner) = self.inner.lock() else {
+            return Err(DeviceError::InvalidOperation(-1)); // Use a custom error code for lock failure
+        };
+
+        inner.set_input_callback(callback)
+    }
+
+    /// Set callback for output only. If you want to set both input and output callback at the same time, use set_callback instead.
+    pub fn set_output_callback<F>(&mut self, callback: Option<F>) -> Result<(), DeviceError>
+    where
+        F: FnMut(&mut [f32]) + Send + 'static,
+    {
+        let Ok(mut inner) = self.inner.lock() else {
+            return Err(DeviceError::InvalidOperation(-1)); // Use a custom error code for lock failure
+        };
+
+        inner.set_output_callback(callback)
+    }
+
+    pub(crate) fn get_ref_id(&self) -> u32 {
+        self.device_ref_id
+    }
+
+    pub(crate) fn attach_track(&mut self, track: &crate::Track) -> Result<(), DeviceError> {
+        let weak = Arc::downgrade(&track.inner);
+
+        if let Err(_) = self.sender.send(AudioHandle::Track(weak)) {
+            return Err(DeviceError::SendAudioHandleFailed);
+        }
 
         Ok(())
     }
 
-    /// Remove [AudioChannel] from the device.
-    pub fn remove_channel(&mut self, channel: &AudioChannel) -> Result<(), AudioDeviceError> {
-        let mut inner = self.inner.lock_poison();
-        inner.remove_channel(channel.ref_id())?;
-
-        Ok(())
-    }
-
-    /// Remove [AudioChannel] from the device by reference id which frok [AudioChannel::ref_id()].
-    pub fn remove_channel_by_ref(&mut self, ref_id: usize) -> Result<(), AudioDeviceError> {
-        let mut inner = self.inner.lock_poison();
-        inner.remove_channel(ref_id)?;
-
-        Ok(())
-    }
-
-    /// Add [AudioMixer] to the device.
-    pub fn add_mixer(&mut self, mixer: &AudioMixer) -> Result<(), AudioDeviceError> {
-        let mut inner = self.inner.lock_poison();
-        inner.add_mixer(mixer.inner.clone())?;
-
-        Ok(())
-    }
-
-    /// Remove [AudioMixer] from the device.
-    pub fn remove_mixer(&mut self, mixer: &AudioMixer) -> Result<(), AudioDeviceError> {
-        let mut inner = self.inner.lock_poison();
-        inner.remove_mixer(mixer.ref_id())?;
-
-        Ok(())
-    }
-
-    /// Remove [AudioMixer] from the device by reference id which frok [AudioMixer::ref_id()].
-    pub fn remove_mixer_by_ref(&mut self, ref_id: usize) -> Result<(), AudioDeviceError> {
-        let mut inner = self.inner.lock_poison();
-        inner.remove_mixer(ref_id)?;
-
-        Ok(())
-    }
-
-    /// Set DSP callback for the device, useful for custom audio processing before
-    /// sending the audio to the hardware.
-    ///
-    /// The buffer is a slice of f32, non-cliped and non-normalized with length frame_count * channels.
-    pub fn set_dsp_callback(
+    pub(crate) fn attach_sample(
         &mut self,
-        callback: AudioDeviceDSPCallback,
-    ) -> Result<(), AudioDeviceError> {
-        // FIXME:
-        let mut inner = self.inner.lock().unwrap();
+        sample: &crate::sample::SampleChannel,
+    ) -> Result<(), DeviceError> {
+        let weak = Arc::downgrade(&sample.inner);
 
-        inner.dsp_callback = Some(callback);
+        if let Err(_) = self.sender.send(AudioHandle::Sample(weak)) {
+            return Err(DeviceError::SendAudioHandleFailed);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn attach_mixer(&mut self, mixer: &crate::Mixer) -> Result<(), DeviceError> {
+        let weak = Arc::downgrade(&mixer.inner);
+
+        if let Err(_) = self.sender.send(AudioHandle::Mixer(weak)) {
+            return Err(DeviceError::SendAudioHandleFailed);
+        }
 
         Ok(())
     }
 }
 
-impl AudioPropertyHandler for AudioDevice {
-    fn get_attribute_f32(&self, _type: AudioAttributes) -> Result<f32, AudioPropertyError> {
+impl PropertyHandler for Device {
+    fn get_attribute_f32(&self, _type: AudioAttributes) -> Result<f32, PropertyError> {
         let inner = self.inner.lock().unwrap();
 
         match _type {
-            AudioAttributes::Unknown => Err(AudioPropertyError::UnsupportedAttribute(
-                "Unknown attribute",
-            )),
-            AudioAttributes::SampleRate => Ok(inner.resampler.sample_rate as f32),
+            AudioAttributes::Unknown => {
+                Err(PropertyError::UnsupportedAttribute("Unknown attribute"))
+            }
             AudioAttributes::Volume => Ok(inner.volume.volume),
             AudioAttributes::Pan => Ok(inner.panner.pan),
-            AudioAttributes::AudioFX => Err(AudioPropertyError::UnsupportedAttribute(
+            AudioAttributes::FXEnabled => Err(PropertyError::UnsupportedAttribute(
                 "AudioFX is not supported, use set_attribute_bool to enable it",
             )),
-            AudioAttributes::AudioSpatialization => Err(AudioPropertyError::UnsupportedAttribute(
+            AudioAttributes::SpatializationEnabled => Err(PropertyError::UnsupportedAttribute(
                 "AudioSpatialization is not supported, use set_attribute_bool to enable it",
             )),
-            AudioAttributes::FXPitch => {
-                let fx = inner.fx.as_ref();
-                if let Some(fx) = fx {
-                    Ok(fx.octave)
-                } else {
-                    Err(AudioPropertyError::AudioFXError(AudioFXError::NotEnabled))
-                }
-            }
-            AudioAttributes::FXTempo => {
-                let fx = inner.fx.as_ref();
-                if let Some(fx) = fx {
-                    Ok(fx.tempo)
-                } else {
-                    Err(AudioPropertyError::AudioFXError(AudioFXError::NotEnabled))
-                }
-            }
+            _ => Err(PropertyError::UnsupportedAttribute("Unsupported attribute")),
         }
     }
 
     fn set_attribute_f32(
-        &self,
+        &mut self,
         _type: AudioAttributes,
         _value: f32,
-    ) -> Result<(), AudioPropertyError> {
+    ) -> Result<(), PropertyError> {
         let mut inner = self.inner.lock().unwrap();
 
         match _type {
-            AudioAttributes::Unknown => Err(AudioPropertyError::UnsupportedAttribute(
-                "Unknown attribute",
-            )),
-            AudioAttributes::SampleRate => {
-                inner.resampler.set_target_sample_rate(_value as u32);
-                Ok(())
+            AudioAttributes::Unknown => {
+                Err(PropertyError::UnsupportedAttribute("Unknown attribute"))
             }
             AudioAttributes::Volume => {
                 inner.volume.set_volume(_value);
@@ -339,84 +243,45 @@ impl AudioPropertyHandler for AudioDevice {
                 inner.panner.set_pan(_value);
                 Ok(())
             }
-            AudioAttributes::AudioFX => Err(AudioPropertyError::UnsupportedAttribute(
+            AudioAttributes::FXEnabled => Err(PropertyError::UnsupportedAttribute(
                 "AudioFX is not supported, use set_attribute_bool to enable it",
             )),
-            AudioAttributes::AudioSpatialization => Err(AudioPropertyError::UnsupportedAttribute(
+            AudioAttributes::SpatializationEnabled => Err(PropertyError::UnsupportedAttribute(
                 "AudioSpatialization is not supported, use set_attribute_bool to enable it",
             )),
-            AudioAttributes::FXPitch => {
-                let fx = inner.fx.as_mut();
-                if let Some(fx) = fx {
-                    if let Err(e) = fx.set_octave(_value) {
-                        return Err(AudioPropertyError::AudioFXError(e));
-                    }
-
-                    Ok(())
-                } else {
-                    Err(AudioPropertyError::AudioFXError(AudioFXError::NotEnabled))
-                }
-            }
-            AudioAttributes::FXTempo => {
-                let fx = inner.fx.as_mut();
-                if let Some(fx) = fx {
-                    if let Err(e) = fx.set_tempo(_value) {
-                        return Err(AudioPropertyError::AudioFXError(e));
-                    }
-
-                    Ok(())
-                } else {
-                    Err(AudioPropertyError::AudioFXError(AudioFXError::NotEnabled))
-                }
-            }
+            _ => Err(PropertyError::UnsupportedAttribute("Unsupported attribute")),
         }
     }
 
-    fn get_attribute_bool(&self, _type: AudioAttributes) -> Result<bool, AudioPropertyError> {
+    fn get_attribute_bool(&self, _type: AudioAttributes) -> Result<bool, PropertyError> {
         let inner = self.inner.lock().unwrap();
 
         match _type {
-            AudioAttributes::Unknown => Err(AudioPropertyError::UnsupportedAttribute(
-                "Unknown attribute",
-            )),
-            AudioAttributes::AudioFX => Ok(inner.fx.is_some()),
-            AudioAttributes::AudioSpatialization => Ok(inner.spatialization.is_some()),
-            _ => Err(AudioPropertyError::UnsupportedAttribute(
-                "Unsupported attribute",
-            )),
+            AudioAttributes::Unknown => {
+                Err(PropertyError::UnsupportedAttribute("Unknown attribute"))
+            }
+            AudioAttributes::SpatializationEnabled => Ok(inner.spatialization.is_some()),
+            _ => Err(PropertyError::UnsupportedAttribute("Unsupported attribute")),
         }
     }
 
     fn set_attribute_bool(
-        &self,
+        &mut self,
         _type: AudioAttributes,
         _value: bool,
-    ) -> Result<(), AudioPropertyError> {
+    ) -> Result<(), PropertyError> {
         let mut inner = self.inner.lock().unwrap();
 
         match _type {
-            AudioAttributes::Unknown => Err(AudioPropertyError::UnsupportedAttribute(
-                "Unknown attribute",
-            )),
-            AudioAttributes::AudioFX => {
-                if _value {
-                    let fx = AudioFX::new(inner.resampler.channels, inner.resampler.sample_rate);
-
-                    if let Err(e) = fx {
-                        return Err(AudioPropertyError::AudioFXError(e));
-                    }
-
-                    inner.fx = fx.ok();
-                } else {
-                    inner.fx = None;
-                }
-                Ok(())
+            AudioAttributes::Unknown => {
+                Err(PropertyError::UnsupportedAttribute("Unknown attribute"))
             }
-            AudioAttributes::AudioSpatialization => {
+            AudioAttributes::SpatializationEnabled => {
                 if _value {
-                    let spatialization = AudioSpatializationListener::new(inner.resampler.channels);
+                    let spatialization =
+                        SpatializationListener::new(inner.device.playback.channels);
                     if let Err(e) = spatialization {
-                        return Err(AudioPropertyError::SpatializationListenerError(e));
+                        return Err(PropertyError::from_other(e));
                     }
 
                     inner.spatialization = spatialization.ok();
@@ -425,121 +290,117 @@ impl AudioPropertyHandler for AudioDevice {
                 }
                 Ok(())
             }
-            _ => Err(AudioPropertyError::UnsupportedAttribute(
-                "Unsupported attribute",
-            )),
+            _ => Err(PropertyError::UnsupportedAttribute("Unsupported attribute")),
         }
     }
 }
 
-impl AudioSpartialListenerHandler for AudioDevice {
-    fn set_position(&self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationListenerError> {
+impl SpartialListenerHandler for Device {
+    fn set_position(&self, position: Vector3<f32>) -> Result<(), SpatializationListenerError> {
         let mut inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_mut() {
-            spatialization.set_position(x, y, z);
+            spatialization.set_position(position);
             Ok(())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn get_position(&self) -> Result<(f32, f32, f32), AudioSpatializationListenerError> {
+    fn get_position(&self) -> Result<Vector3<f32>, SpatializationListenerError> {
         let inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_ref() {
             Ok(spatialization.get_position())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
     fn set_direction(
         &self,
-        x: f32,
-        y: f32,
-        z: f32,
-    ) -> Result<(), AudioSpatializationListenerError> {
+        position: Vector3<f32>,
+    ) -> Result<(), SpatializationListenerError> {
         let mut inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_mut() {
-            spatialization.set_direction(x, y, z);
+            spatialization.set_direction(position);
             Ok(())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn get_direction(&self) -> Result<(f32, f32, f32), AudioSpatializationListenerError> {
+    fn get_direction(&self) -> Result<Vector3<f32>, SpatializationListenerError> {
         let inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_ref() {
             Ok(spatialization.get_direction())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn set_velocity(&self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationListenerError> {
+    fn set_velocity(&self, position: Vector3<f32>) -> Result<(), SpatializationListenerError> {
         let mut inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_mut() {
-            spatialization.set_velocity(x, y, z);
+            spatialization.set_velocity(position);
             Ok(())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn get_velocity(&self) -> Result<(f32, f32, f32), AudioSpatializationListenerError> {
+    fn get_velocity(&self) -> Result<Vector3<f32>, SpatializationListenerError> {
         let inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_ref() {
             Ok(spatialization.get_velocity())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn set_speed_of_sound(&self, speed: f32) -> Result<(), AudioSpatializationListenerError> {
+    fn set_speed_of_sound(&self, speed: f32) -> Result<(), SpatializationListenerError> {
         let mut inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_mut() {
             spatialization.set_speed_of_sound(speed);
             Ok(())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn get_speed_of_sound(&self) -> Result<f32, AudioSpatializationListenerError> {
+    fn get_speed_of_sound(&self) -> Result<f32, SpatializationListenerError> {
         let inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_ref() {
             Ok(spatialization.get_speed_of_sound())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn set_world_up(&self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationListenerError> {
+    fn set_world_up(&self, position: Vector3<f32>) -> Result<(), SpatializationListenerError> {
         let mut inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_mut() {
-            spatialization.set_world_up(x, y, z);
+            spatialization.set_world_up(position);
             Ok(())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn get_world_up(&self) -> Result<(f32, f32, f32), AudioSpatializationListenerError> {
+    fn get_world_up(&self) -> Result<Vector3<f32>, SpatializationListenerError> {
         let inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_ref() {
             Ok(spatialization.get_world_up())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
@@ -548,45 +409,45 @@ impl AudioSpartialListenerHandler for AudioDevice {
         inner_angle: f32,
         outer_angle: f32,
         outer_gain: f32,
-    ) -> Result<(), AudioSpatializationListenerError> {
+    ) -> Result<(), SpatializationListenerError> {
         let mut inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_mut() {
             spatialization.set_cone(inner_angle, outer_angle, outer_gain);
             Ok(())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn get_cone(&self) -> Result<(f32, f32, f32), AudioSpatializationListenerError> {
+    fn get_cone(&self) -> Result<(f32, f32, f32), SpatializationListenerError> {
         let inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_ref() {
             Ok(spatialization.get_cone())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn set_enabled(&self, is_enabled: bool) -> Result<(), AudioSpatializationListenerError> {
+    fn set_enabled(&self, is_enabled: bool) -> Result<(), SpatializationListenerError> {
         let mut inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_mut() {
             spatialization.set_enabled(is_enabled);
             Ok(())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 
-    fn is_enabled(&self) -> Result<bool, AudioSpatializationListenerError> {
+    fn is_enabled(&self) -> Result<bool, SpatializationListenerError> {
         let inner_lock = self.inner.lock().unwrap();
 
         if let Some(spatialization) = inner_lock.spatialization.as_ref() {
             Ok(spatialization.is_enabled())
         } else {
-            Err(AudioSpatializationListenerError::NotInitialized)
+            Err(SpatializationListenerError::NotInitialized)
         }
     }
 }

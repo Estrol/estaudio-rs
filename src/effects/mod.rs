@@ -1,3 +1,4 @@
+mod channel_converter;
 mod fx;
 mod panner;
 mod resampler;
@@ -5,14 +6,15 @@ mod spartilization_listener;
 mod spatialization;
 mod volume;
 
+pub use channel_converter::ChannelConverter;
 pub use fx::{AudioFX, AudioFXError};
-pub use panner::{AudioPanner, AudioPannerError};
-pub use resampler::{AudioResampler, AudioResamplerError};
+pub use panner::AudioPanner;
+pub use resampler::Resampler;
 pub use spartilization_listener::{
-    AudioSpartialListenerHandler, AudioSpatializationListener, AudioSpatializationListenerError,
+    SpartialListenerHandler, SpatializationListener, SpatializationListenerError,
 };
 pub use spatialization::{
-    AttenuationModel, AudioSpatialization, AudioSpatializationError, AudioSpatializationHandler,
+    AttenuationModel, Spatialization, SpatializationError, SpatializationHandler,
     Positioning,
 };
-pub use volume::{AudioVolume, AudioVolumeError};
+pub use volume::AudioVolume;

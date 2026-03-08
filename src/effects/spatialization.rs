@@ -1,64 +1,52 @@
+#![allow(dead_code)]
+
 use miniaudio_sys::*;
+use thiserror::Error;
 
-use crate::{device::AudioDevice, utils};
+use crate::{device::Device, math::Vector3, utils};
 
-use super::spartilization_listener::AudioSpatializationListener;
+use super::spartilization_listener::SpatializationListener;
 
-#[derive(Debug, Clone)]
-pub enum AudioSpatializationError {
+#[derive(Debug, Error)]
+pub enum SpatializationError {
+    #[error("Initialization failed with error code: {}, {}", .0, self.get_ma_error().unwrap_or("Unknown error"))]
     InitializationFailed(i32), // Holds the error code from miniaudio
-    InvalidChannels(u32),      // Holds the invalid channel count
-    ProcessError(i32),         // Holds a custom error message for processing errors
-    OperationError(i32),       // Holds a custom error message for general operation errors
-    NotInitialized,            // Indicates that the spatializer was not initialized properly
-    ListenerNotInitialized,    // Indicates that the listener was not initialized properly
+    #[error("Invalid number of channels: {0}")]
+    InvalidChannels(usize), // Holds the invalid channel count
+    #[error("Failed to process spatialization with error code: {0}")]
+    ProcessError(i32), // Holds a custom error message for processing errors
+    #[error("Operation error with error code: {0}")]
+    OperationError(i32), // Holds a custom error message for general operation errors
+    #[error("Instance not initialized")]
+    NotInitialized,
+    #[error("{0}")]
+    Other(Box<dyn std::error::Error + Send + 'static>),
 }
 
-impl std::fmt::Display for AudioSpatializationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl SpatializationError {
+    pub fn get_ma_error(&self) -> Option<&str> {
         match self {
-            AudioSpatializationError::InitializationFailed(code) => {
-                write!(
-                    f,
-                    "Initialization failed with error code: {} ({})",
-                    code,
-                    utils::ma_to_string_result(*code)
-                )
+            SpatializationError::InitializationFailed(code)
+            | SpatializationError::ProcessError(code)
+            | SpatializationError::OperationError(code) => {
+                Some(utils::ma_to_string_result(*code))
             }
-            AudioSpatializationError::InvalidChannels(channels) => {
-                write!(f, "Invalid number of channels: {}", channels)
-            }
-            AudioSpatializationError::ProcessError(code) => {
-                write!(
-                    f,
-                    "Failed to process spatialization: {} ({})",
-                    code,
-                    utils::ma_to_string_result(*code)
-                )
-            }
-            AudioSpatializationError::OperationError(code) => {
-                write!(
-                    f,
-                    "Operation error: {} ({})",
-                    code,
-                    utils::ma_to_string_result(*code)
-                )
-            }
-            AudioSpatializationError::NotInitialized => {
-                write!(f, "Spatializer channel not initialized")
-            }
-            AudioSpatializationError::ListenerNotInitialized => {
-                write!(f, "Spatializer device listener not initialized")
-            }
+            _ => None,
         }
+    }
+
+    pub fn from_other<E: std::error::Error + Send + 'static>(error: E) -> Self {
+        SpatializationError::Other(Box::new(error))
     }
 }
 
-pub struct AudioSpatialization {
-    pub spatialization: Box<ma_spatializer>,
+#[derive(Debug)]
+pub struct Spatialization {
+    pub handle: Box<ma_spatializer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub enum AttenuationModel {
     None = 0,
     Inverse = 1,
@@ -79,6 +67,7 @@ impl From<i32> for AttenuationModel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub enum Positioning {
     Absolute = 0,
     Relative = 1,
@@ -95,160 +84,185 @@ impl From<i32> for Positioning {
 }
 
 #[allow(dead_code)]
-impl AudioSpatialization {
-    pub fn new(channels_in: u32, channels_out: u32) -> Result<Self, AudioSpatializationError> {
+impl Spatialization {
+    pub fn new(channels_in: usize, channels_out: usize) -> Result<Self, SpatializationError> {
+        if channels_in < 1 || channels_in > 8 {
+            return Err(SpatializationError::InvalidChannels(channels_in));
+        }
+
+        if channels_out < 1 || channels_out > 8 {
+            return Err(SpatializationError::InvalidChannels(channels_out));
+        }
+
         unsafe {
             let mut spatializer = Box::<ma_spatializer>::new_uninit();
-            let config = ma_spatializer_config_init(channels_in, channels_out);
+            let config = ma_spatializer_config_init(
+                channels_in as u32, 
+                channels_out as u32);
 
-            let result =
-                ma_spatializer_init(&config, std::ptr::null_mut(), spatializer.as_mut_ptr());
+            let result = ma_spatializer_init(
+                &config, 
+                std::ptr::null_mut(), 
+                spatializer.as_mut_ptr());
 
             if result != 0 {
-                return Err(AudioSpatializationError::InitializationFailed(result));
+                return Err(SpatializationError::InitializationFailed(result));
             }
 
-            let spatializer = spatializer.assume_init();
+            let handle = spatializer.assume_init();
 
-            Ok(AudioSpatialization {
-                spatialization: spatializer,
+            Ok(Spatialization {
+                handle,
             })
         }
     }
 
     pub fn process(
         &mut self,
-        listener: &mut AudioSpatializationListener,
+        listener: &mut SpatializationListener,
         input: &[f32],
         output: &mut [f32],
-        frame_count: u64,
-    ) -> Result<(), AudioSpatializationError> {
+    ) -> Result<(), SpatializationError> {
+        let min_length = input.len().min(output.len());
+        let frame_count = crate::macros::frame_count_from!(min_length, self.get_input_channels());
+
+        let required_input_len =
+            crate::macros::array_len_from!(frame_count, self.get_input_channels());
+        let required_output_len =
+            crate::macros::array_len_from!(frame_count, self.get_output_channels());
+
+        if input.len() < required_input_len || output.len() < required_output_len {
+            return Err(SpatializationError::ProcessError(-2));
+        }
+
         unsafe {
             let result = ma_spatializer_process_pcm_frames(
-                self.spatialization.as_mut(),
-                listener.spatialization.as_mut(),
+                self.handle.as_mut(),
+                listener.handle.as_mut(),
                 output.as_mut_ptr() as *mut std::ffi::c_void,
                 input.as_ptr() as *const std::ffi::c_void,
-                frame_count,
+                frame_count as u64,
             );
 
             if result != 0 {
-                return Err(AudioSpatializationError::ProcessError(result));
+                return Err(SpatializationError::ProcessError(result));
             }
 
             Ok(())
         }
     }
 
-    pub fn set_master_volume(&mut self, volume: f32) -> Result<(), AudioSpatializationError> {
+    pub fn set_master_volume(&mut self, volume: f32) -> Result<(), SpatializationError> {
         unsafe {
-            let result = ma_spatializer_set_master_volume(self.spatialization.as_mut(), volume);
+            let result = ma_spatializer_set_master_volume(self.handle.as_mut(), volume);
             if result != 0 {
-                return Err(AudioSpatializationError::OperationError(result));
+                return Err(SpatializationError::OperationError(result));
             }
             Ok(())
         }
     }
 
-    pub fn get_master_volume(&self) -> Result<f32, AudioSpatializationError> {
+    pub fn get_master_volume(&self) -> Result<f32, SpatializationError> {
         unsafe {
             let mut volume: f32 = 0.0;
-            let result =
-                ma_spatializer_get_master_volume(self.spatialization.as_ref(), &mut volume);
+            let result = ma_spatializer_get_master_volume(
+                self.handle.as_ref(), 
+                &mut volume);
+            
             if result != 0 {
-                return Err(AudioSpatializationError::OperationError(result));
+                return Err(SpatializationError::OperationError(result));
             }
             Ok(volume)
         }
     }
 
     pub fn get_input_channels(&self) -> u32 {
-        unsafe { ma_spatializer_get_input_channels(self.spatialization.as_ref()) }
+        unsafe { ma_spatializer_get_input_channels(self.handle.as_ref()) }
     }
 
     pub fn get_output_channels(&self) -> u32 {
-        unsafe { ma_spatializer_get_output_channels(self.spatialization.as_ref()) }
+        unsafe { ma_spatializer_get_output_channels(self.handle.as_ref()) }
     }
 
     pub fn set_attenuation_model(&mut self, attenuation_model: AttenuationModel) {
         unsafe {
             ma_spatializer_set_attenuation_model(
-                self.spatialization.as_mut(),
+                self.handle.as_mut(),
                 attenuation_model as i32,
             );
         }
     }
 
     pub fn get_attenuation_model(&self) -> AttenuationModel {
-        let model = unsafe { ma_spatializer_get_attenuation_model(self.spatialization.as_ref()) };
+        let model = unsafe { ma_spatializer_get_attenuation_model(self.handle.as_ref()) };
         AttenuationModel::from(model)
     }
 
     pub fn set_positioning(&mut self, positioning: Positioning) {
         unsafe {
-            ma_spatializer_set_positioning(self.spatialization.as_mut(), positioning as i32);
+            ma_spatializer_set_positioning(self.handle.as_mut(), positioning as i32);
         }
     }
 
     pub fn get_positioning(&self) -> Positioning {
-        let positioning = unsafe { ma_spatializer_get_positioning(self.spatialization.as_ref()) };
+        let positioning = unsafe { ma_spatializer_get_positioning(self.handle.as_ref()) };
         Positioning::from(positioning)
     }
 
     pub fn set_rolloff(&mut self, rolloff: f32) {
         unsafe {
-            ma_spatializer_set_rolloff(self.spatialization.as_mut(), rolloff);
+            ma_spatializer_set_rolloff(self.handle.as_mut(), rolloff);
         }
     }
 
     pub fn get_rolloff(&self) -> f32 {
-        unsafe { ma_spatializer_get_rolloff(self.spatialization.as_ref()) }
+        unsafe { ma_spatializer_get_rolloff(self.handle.as_ref()) }
     }
 
     pub fn set_min_gain(&mut self, min_gain: f32) {
         unsafe {
-            ma_spatializer_set_min_gain(self.spatialization.as_mut(), min_gain);
+            ma_spatializer_set_min_gain(self.handle.as_mut(), min_gain);
         }
     }
 
     pub fn get_min_gain(&self) -> f32 {
-        unsafe { ma_spatializer_get_min_gain(self.spatialization.as_ref()) }
+        unsafe { ma_spatializer_get_min_gain(self.handle.as_ref()) }
     }
 
     pub fn set_max_gain(&mut self, max_gain: f32) {
         unsafe {
-            ma_spatializer_set_max_gain(self.spatialization.as_mut(), max_gain);
+            ma_spatializer_set_max_gain(self.handle.as_mut(), max_gain);
         }
     }
 
     pub fn get_max_gain(&self) -> f32 {
-        unsafe { ma_spatializer_get_max_gain(self.spatialization.as_ref()) }
+        unsafe { ma_spatializer_get_max_gain(self.handle.as_ref()) }
     }
 
     pub fn set_min_distance(&mut self, min_distance: f32) {
         unsafe {
-            ma_spatializer_set_min_distance(self.spatialization.as_mut(), min_distance);
+            ma_spatializer_set_min_distance(self.handle.as_mut(), min_distance);
         }
     }
 
     pub fn get_min_distance(&self) -> f32 {
-        unsafe { ma_spatializer_get_min_distance(self.spatialization.as_ref()) }
+        unsafe { ma_spatializer_get_min_distance(self.handle.as_ref()) }
     }
 
     pub fn set_max_distance(&mut self, max_distance: f32) {
         unsafe {
-            ma_spatializer_set_max_distance(self.spatialization.as_mut(), max_distance);
+            ma_spatializer_set_max_distance(self.handle.as_mut(), max_distance);
         }
     }
 
     pub fn get_max_distance(&self) -> f32 {
-        unsafe { ma_spatializer_get_max_distance(self.spatialization.as_ref()) }
+        unsafe { ma_spatializer_get_max_distance(self.handle.as_ref()) }
     }
 
     pub fn set_cone(&mut self, inner_angle: f32, outer_angle: f32, outer_gain: f32) {
         unsafe {
             ma_spatializer_set_cone(
-                self.spatialization.as_mut(),
+                self.handle.as_mut(),
                 inner_angle,
                 outer_angle,
                 outer_gain,
@@ -262,102 +276,104 @@ impl AudioSpatialization {
             let mut outer_angle = 0.0;
             let mut outer_gain = 0.0;
             ma_spatializer_get_cone(
-                self.spatialization.as_ref(),
+                self.handle.as_ref(),
                 &mut inner_angle,
                 &mut outer_angle,
                 &mut outer_gain,
             );
+            
             (inner_angle, outer_angle, outer_gain)
         }
     }
 
     pub fn set_doppler_factor(&mut self, doppler_factor: f32) {
         unsafe {
-            ma_spatializer_set_doppler_factor(self.spatialization.as_mut(), doppler_factor);
+            ma_spatializer_set_doppler_factor(self.handle.as_mut(), doppler_factor);
         }
     }
 
     pub fn get_doppler_factor(&self) -> f32 {
-        unsafe { ma_spatializer_get_doppler_factor(self.spatialization.as_ref()) }
+        unsafe { ma_spatializer_get_doppler_factor(self.handle.as_ref()) }
     }
 
     pub fn set_directional_attenuation_factor(&mut self, directional_attenuation_factor: f32) {
         unsafe {
             ma_spatializer_set_directional_attenuation_factor(
-                self.spatialization.as_mut(),
+                self.handle.as_mut(),
                 directional_attenuation_factor,
             );
         }
     }
 
     pub fn get_directional_attenuation_factor(&self) -> f32 {
-        unsafe { ma_spatializer_get_directional_attenuation_factor(self.spatialization.as_ref()) }
+        unsafe { ma_spatializer_get_directional_attenuation_factor(self.handle.as_ref()) }
     }
 
-    pub fn set_position(&mut self, x: f32, y: f32, z: f32) {
+    pub fn set_position(&mut self, position: Vector3<f32>) {
         unsafe {
-            ma_spatializer_set_position(self.spatialization.as_mut(), x, y, z);
+            ma_spatializer_set_position(self.handle.as_mut(), position.x, position.y, position.z);
         }
     }
 
-    pub fn get_position(&self) -> (f32, f32, f32) {
+    pub fn get_position(&self) -> Vector3<f32> {
         unsafe {
-            let pos = ma_spatializer_get_position(self.spatialization.as_ref());
-            (pos.x, pos.y, pos.z)
+            let pos = ma_spatializer_get_position(self.handle.as_ref());
+            
+            Vector3::new(pos.x, pos.y, pos.z)
         }
     }
 
-    pub fn set_direction(&mut self, x: f32, y: f32, z: f32) {
+    pub fn set_direction(&mut self, position: Vector3<f32>) {
         unsafe {
-            ma_spatializer_set_direction(self.spatialization.as_mut(), x, y, z);
+            ma_spatializer_set_direction(self.handle.as_mut(), position.x, position.y, position.z);
         }
     }
 
-    pub fn get_direction(&self) -> (f32, f32, f32) {
+    pub fn get_direction(&self) -> Vector3<f32> {
         unsafe {
-            let dir = ma_spatializer_get_direction(self.spatialization.as_ref());
-            (dir.x, dir.y, dir.z)
+            let dir = ma_spatializer_get_direction(self.handle.as_ref());
+            Vector3::new(dir.x, dir.y, dir.z)
         }
     }
 
-    pub fn set_velocity(&mut self, x: f32, y: f32, z: f32) {
+    pub fn set_velocity(&mut self, position: Vector3<f32>) {
         unsafe {
-            ma_spatializer_set_velocity(self.spatialization.as_mut(), x, y, z);
+            ma_spatializer_set_velocity(self.handle.as_mut(), position.x, position.y, position.z);
         }
     }
 
-    pub fn get_velocity(&self) -> (f32, f32, f32) {
+    pub fn get_velocity(&self) -> Vector3<f32> {
         unsafe {
-            let vel = ma_spatializer_get_velocity(self.spatialization.as_ref());
-            (vel.x, vel.y, vel.z)
+            let vel = ma_spatializer_get_velocity(self.handle.as_ref());
+            Vector3::new(vel.x, vel.y, vel.z)
         }
     }
 
     pub fn get_relative_position_and_direction(
         &self,
-        listener: &AudioSpatializationListener,
-    ) -> ((f32, f32, f32), (f32, f32, f32)) {
+        listener: &SpatializationListener,
+    ) -> (Vector3<f32>, Vector3<f32>) {
         unsafe {
             let mut relative_pos = ma_vec3f::default();
             let mut relative_dir = ma_vec3f::default();
             ma_spatializer_get_relative_position_and_direction(
-                self.spatialization.as_ref(),
-                listener.spatialization.as_ref(),
+                self.handle.as_ref(),
+                listener.handle.as_ref(),
                 &mut relative_pos,
                 &mut relative_dir,
             );
             (
-                (relative_pos.x, relative_pos.y, relative_pos.z),
-                (relative_dir.x, relative_dir.y, relative_dir.z),
+                Vector3::new(relative_pos.x, relative_pos.y, relative_pos.z),
+                Vector3::new(relative_dir.x, relative_dir.y, relative_dir.z),
             )
         }
     }
 }
 
-impl Drop for AudioSpatialization {
+impl Drop for Spatialization {
     fn drop(&mut self) {
         unsafe {
-            ma_spatializer_uninit(self.spatialization.as_mut(), std::ptr::null_mut());
+            ma_spatializer_uninit(self.handle.as_mut(), std::ptr::null_mut());
         }
     }
 }
@@ -366,100 +382,100 @@ impl Drop for AudioSpatialization {
 /// This includes setting and retrieving the position, velocity, direction, and
 /// other spatial properties of an audio source, as well as configuring
 /// attenuation models and other related parameters.
-pub trait AudioSpatializationHandler {
+pub trait SpatializationHandler {
     /// Set the position of the audio source in 3D space.
-    fn set_position(&mut self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationError>;
+    fn spatial_set_position(&mut self, position: Vector3<f32>) -> Result<(), SpatializationError>;
 
     /// Get the position of the audio source in 3D space.
-    fn get_position(&self) -> Result<(f32, f32, f32), AudioSpatializationError>;
+    fn spatial_get_position(&self) -> Result<Vector3<f32>, SpatializationError>;
 
     /// Set the velocity of the audio source in 3D space.
-    fn set_velocity(&mut self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationError>;
+    fn spatial_set_velocity(&mut self, position: Vector3<f32>) -> Result<(), SpatializationError>;
 
     /// Get the velocity of the audio source in 3D space.
-    fn get_velocity(&self) -> Result<(f32, f32, f32), AudioSpatializationError>;
+    fn spatial_get_velocity(&self) -> Result<Vector3<f32>, SpatializationError>;
 
     /// Set the direction of the audio source in 3D space.
-    fn set_direction(&mut self, x: f32, y: f32, z: f32) -> Result<(), AudioSpatializationError>;
+    fn spatial_set_direction(&mut self, position: Vector3<f32>) -> Result<(), SpatializationError>;
 
     /// Get the direction of the audio source in 3D space.
-    fn get_direction(&self) -> Result<(f32, f32, f32), AudioSpatializationError>;
+    fn spatial_get_direction(&self) -> Result<Vector3<f32>, SpatializationError>;
 
     /// Set the Doppler factor for the audio source.
-    fn set_doppler_factor(&mut self, doppler_factor: f32) -> Result<(), AudioSpatializationError>;
+    fn spatial_set_doppler_factor(&mut self, doppler_factor: f32) -> Result<(), SpatializationError>;
 
     /// Get the Doppler factor of the audio source.
-    fn get_doppler_factor(&self) -> Result<f32, AudioSpatializationError>;
+    fn spatial_get_doppler_factor(&self) -> Result<f32, SpatializationError>;
 
     /// Set the attenuation model for the audio source.
-    fn set_attenuation_model(
+    fn spatial_set_attenuation_model(
         &mut self,
         attenuation_model: AttenuationModel,
-    ) -> Result<(), AudioSpatializationError>;
+    ) -> Result<(), SpatializationError>;
 
     /// Get the attenuation model of the audio source.
-    fn get_attenuation_model(&self) -> Result<AttenuationModel, AudioSpatializationError>;
+    fn spatial_get_attenuation_model(&self) -> Result<AttenuationModel, SpatializationError>;
 
     /// Set the positioning mode for the audio source.
-    fn set_positioning(&mut self, positioning: Positioning)
-    -> Result<(), AudioSpatializationError>;
+    fn spatial_set_positioning(&mut self, positioning: Positioning)
+    -> Result<(), SpatializationError>;
 
     /// Get the positioning mode of the audio source.
-    fn get_positioning(&self) -> Result<Positioning, AudioSpatializationError>;
+    fn spatial_get_positioning(&self) -> Result<Positioning, SpatializationError>;
 
     /// Set the rolloff factor for the audio source.
-    fn set_rolloff(&mut self, rolloff: f32) -> Result<(), AudioSpatializationError>;
+    fn spatial_set_rolloff(&mut self, rolloff: f32) -> Result<(), SpatializationError>;
 
     /// Get the rolloff factor of the audio source.
-    fn get_rolloff(&self) -> Result<f32, AudioSpatializationError>;
+    fn spatial_get_rolloff(&self) -> Result<f32, SpatializationError>;
 
     /// Set the minimum gain for the audio source.
-    fn set_min_gain(&mut self, min_gain: f32) -> Result<(), AudioSpatializationError>;
+    fn spatial_set_min_gain(&mut self, min_gain: f32) -> Result<(), SpatializationError>;
 
     /// Get the minimum gain of the audio source.
-    fn get_min_gain(&self) -> Result<f32, AudioSpatializationError>;
+    fn spatial_get_min_gain(&self) -> Result<f32, SpatializationError>;
 
     /// Set the maximum gain for the audio source.
-    fn set_max_gain(&mut self, max_gain: f32) -> Result<(), AudioSpatializationError>;
+    fn spatial_set_max_gain(&mut self, max_gain: f32) -> Result<(), SpatializationError>;
 
     /// Get the maximum gain of the audio source.
-    fn get_max_gain(&self) -> Result<f32, AudioSpatializationError>;
+    fn spatial_get_max_gain(&self) -> Result<f32, SpatializationError>;
 
     /// Set the minimum distance for the audio source.
-    fn set_min_distance(&mut self, min_distance: f32) -> Result<(), AudioSpatializationError>;
+    fn spatial_set_min_distance(&mut self, min_distance: f32) -> Result<(), SpatializationError>;
 
     /// Get the minimum distance of the audio source.
-    fn get_min_distance(&self) -> Result<f32, AudioSpatializationError>;
+    fn spatial_get_min_distance(&self) -> Result<f32, SpatializationError>;
 
     /// Set the maximum distance for the audio source.
-    fn set_max_distance(&mut self, max_distance: f32) -> Result<(), AudioSpatializationError>;
+    fn spatial_set_max_distance(&mut self, max_distance: f32) -> Result<(), SpatializationError>;
 
     /// Get the maximum distance of the audio source.
-    fn get_max_distance(&self) -> Result<f32, AudioSpatializationError>;
+    fn spatial_get_max_distance(&self) -> Result<f32, SpatializationError>;
 
     /// Set the cone parameters for the audio source.
-    fn set_cone(
+    fn spatial_set_cone(
         &mut self,
         inner_angle: f32,
         outer_angle: f32,
         outer_gain: f32,
-    ) -> Result<(), AudioSpatializationError>;
+    ) -> Result<(), SpatializationError>;
 
     /// Get the cone parameters of the audio source.
-    fn get_cone(&self) -> Result<(f32, f32, f32), AudioSpatializationError>;
+    fn spatial_get_cone(&self) -> Result<(f32, f32, f32), SpatializationError>;
 
     /// Set the directional attenuation factor for the audio source.
-    fn set_directional_attenuation_factor(
+    fn spatial_set_directional_attenuation_factor(
         &mut self,
         directional_attenuation_factor: f32,
-    ) -> Result<(), AudioSpatializationError>;
+    ) -> Result<(), SpatializationError>;
 
     /// Get the directional attenuation factor of the audio source.
-    fn get_directional_attenuation_factor(&self) -> Result<f32, AudioSpatializationError>;
+    fn spatial_get_directional_attenuation_factor(&self) -> Result<f32, SpatializationError>;
 
     /// Get the relative position and direction of the audio source with respect to a listener.
-    fn get_relative_position_and_direction(
+    fn spatial_get_relative_position_and_direction(
         &self,
-        listener: &AudioDevice,
-    ) -> Result<((f32, f32, f32), (f32, f32, f32)), AudioSpatializationError>;
+        listener: &Device,
+    ) -> Result<(Vector3<f32>, Vector3<f32>), SpatializationError>;
 }

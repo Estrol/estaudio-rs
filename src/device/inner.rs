@@ -1,421 +1,404 @@
 use miniaudio_sys::*;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, TryLockError, mpsc::Receiver};
 
 use crate::{
-    channel::inner::AudioChannelInner,
-    device::AudioDeviceError,
-    effects::{AudioFX, AudioPanner, AudioResampler, AudioSpatializationListener, AudioVolume},
-    mixer::inner::AudioMixerInner,
-    utils::{self, MutexPoison},
+    DeviceInfo,
+    context::{DeviceType, MaContext},
+    device::{AudioHandle, DeviceError},
+    effects::{AudioPanner, SpatializationListener, AudioVolume, ChannelConverter},
+    math::{MathUtils, MathUtilsTrait as _},
 };
 
-use super::{AudioDeviceDSPCallback, context::AudioHardwareInfo};
+pub struct TrackChannelHandle {
+    pub channel: AudioHandle,
+    pub removed: bool,
+}
 
-pub(crate) struct AudioDeviceInner {
+pub(crate) struct DeviceInner {
+    pub context: Option<Arc<MaContext>>,
     pub device: Box<ma_device>,
-    pub channels: Arc<Mutex<Vec<Arc<Mutex<AudioChannelInner>>>>>,
-    pub mixers: Arc<Mutex<Vec<Arc<Mutex<AudioMixerInner>>>>>,
+    pub ty: DeviceType,
 
+    pub handles: Vec<TrackChannelHandle>,
     pub volume: AudioVolume,
     pub panner: AudioPanner,
-    pub resampler: AudioResampler,
-    pub fx: Option<AudioFX>,
-
-    pub buffer: Vec<f32>,
-    pub temp_buffer: Vec<f32>,
-
-    pub resampler_buffer: Vec<f32>,
+    pub channel_converter: ChannelConverter,
+    pub buffer1: Vec<f32>,
+    pub buffer2: Vec<f32>,
 
     // DSP callback
-    pub dsp_callback: Option<AudioDeviceDSPCallback>,
+    pub callback: Option<Box<dyn FnMut(&[f32], &mut [f32]) + Send + 'static>>,
+    pub input_callback: Option<Box<dyn FnMut(&[f32]) + Send + 'static>>,
+    pub output_callback: Option<Box<dyn FnMut(&mut [f32]) + Send + 'static>>,
 
     // Spatialization
-    pub spatialization: Option<AudioSpatializationListener>,
+    pub spatialization: Option<SpatializationListener>,
+
+    pub receiver: Receiver<AudioHandle>,
 }
 
-impl<T> MutexPoison<T> for Mutex<T> {
-    fn lock_poison(&self) -> MutexGuard<'_, T> {
-        match self.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-
-    fn try_lock_poison(&self) -> Option<MutexGuard<'_, T>> {
-        match self.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
-        }
-    }
-}
-
-impl AudioDeviceInner {
+impl DeviceInner {
     pub fn new(
-        info: Option<&AudioHardwareInfo>,
-        channels: u32,
-        sample_rate: u32,
-    ) -> Result<Box<AudioDeviceInner>, AudioDeviceError> {
+        config: DeviceInfo,
+    ) -> Result<(Box<Self>, std::sync::mpsc::Sender<AudioHandle>), DeviceError> {
         unsafe {
-            let mut inner = Box::new(AudioDeviceInner {
-                device: Box::new(std::mem::zeroed()),
-                channels: Arc::new(Mutex::new(vec![])),
-                mixers: Arc::new(Mutex::new(vec![])),
-                buffer: vec![0.0f32; 4096 * channels as usize],
-                temp_buffer: vec![0.0f32; 4096 * channels as usize],
-                resampler_buffer: vec![0.0f32; 4096 * channels as usize],
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            let channel_count = config.channel;
+            let sample_rate = config.sample_rate;
+            let device_type = config.ty;
+
+            let mut inner = Box::new(Self {
+                context: None,
+                device: Box::default(),
+                handles: Vec::new(),
+                ty: device_type,
+                buffer1: vec![0.0f32; 4096 * channel_count],
+                buffer2: vec![0.0f32; 4096 * channel_count],
                 spatialization: None,
-                volume: AudioVolume::new(channels).map_err(AudioDeviceError::AudioVolumeError)?,
-                panner: AudioPanner::new(channels).map_err(AudioDeviceError::AudioPannerError)?,
-                resampler: AudioResampler::new(channels, sample_rate)
-                    .map_err(AudioDeviceError::AudioResamplerError)?,
-                dsp_callback: None,
-                fx: None,
+                volume: AudioVolume::new(channel_count).map_err(DeviceError::from_other)?,
+                panner: AudioPanner::new(channel_count).map_err(DeviceError::from_other)?,
+                channel_converter: ChannelConverter::new(),
+                callback: None,
+                input_callback: None,
+                output_callback: None,
+                receiver,
             });
 
-            let mut config = ma_device_config_init(ma_device_type_playback);
+            let device_type = match config.ty {
+                DeviceType::Playback => ma_device_type_playback,
+                DeviceType::Capture => ma_device_type_capture,
+                DeviceType::Duplex => ma_device_type_duplex,
+            };
 
-            config.playback.format = ma_format_f32;
-            config.playback.channels = channels;
-            config.sampleRate = sample_rate;
-            config.dataCallback = Some(audio_callback);
-            config.pUserData = inner.as_mut() as *mut _ as *mut std::ffi::c_void;
+            let mut devconfig = ma_device_config_init(device_type);
 
+            devconfig.playback.format = ma_format_f32;
+            devconfig.playback.channels = channel_count as u32;
+            devconfig.sampleRate = sample_rate as u32;
+            devconfig.dataCallback = Some(audio_callback);
+            devconfig.pUserData = inner.as_mut() as *mut _ as *mut std::ffi::c_void;
+            devconfig.noClip = MA_TRUE as u8; // We use SIMD clamping
+            devconfig.noPreSilencedOutputBuffer = MA_TRUE as u8; // We use SIMD zeroing
+
+            // Store temporary context for lifetime and validation purposes.
             let mut context = None;
-            if let Some(hw_info) = info {
-                config.playback.pDeviceID = &hw_info.id;
-                context = Some(hw_info.context.clone());
+            match config.ty {
+                DeviceType::Playback => {
+                    if let Some(hw_info) = config.output {
+                        if hw_info.ty != DeviceType::Playback {
+                            return Err(DeviceError::UnsupportedHardwareDevice);
+                        }
+
+                        if hw_info.id.is_some() {
+                            devconfig.playback.pDeviceID = hw_info.id.as_ref().unwrap();
+                        }
+
+                        context = Some(Arc::clone(&hw_info.ctx));
+                    }
+                }
+                DeviceType::Capture => {
+                    if let Some(hw_info) = config.input {
+                        if hw_info.ty != DeviceType::Capture {
+                            return Err(DeviceError::UnsupportedHardwareDevice);
+                        }
+
+                        if hw_info.id.is_some() {
+                            devconfig.capture.pDeviceID = hw_info.id.as_ref().unwrap();
+                        }
+
+                        context = Some(Arc::clone(&hw_info.ctx));
+                    }
+                }
+                DeviceType::Duplex => {
+                    if let Some(hw_info) = config.output {
+                        if hw_info.ty != DeviceType::Playback {
+                            return Err(DeviceError::UnsupportedHardwareDevice);
+                        }
+
+                        if hw_info.id.is_some() {
+                            devconfig.playback.pDeviceID = hw_info.id.as_ref().unwrap();
+                        }
+
+                        context = Some(Arc::clone(&hw_info.ctx));
+                    }
+
+                    if let Some(hw_info) = config.input {
+                        if hw_info.ty != DeviceType::Capture {
+                            return Err(DeviceError::UnsupportedHardwareDevice);
+                        }
+
+                        if hw_info.id.is_some() {
+                            devconfig.capture.pDeviceID = hw_info.id.as_ref().unwrap();
+                        }
+
+                        // Have to check if context is same.
+                        if let Some(context) = &context {
+                            if !Arc::ptr_eq(context, &hw_info.ctx) {
+                                return Err(DeviceError::UnsupportedHardwareDevice);
+                            }
+                        } else {
+                            context = Some(Arc::clone(&hw_info.ctx));
+                        }
+                    }
+                }
             }
 
             let result = if let Some(context) = context {
-                let context_lock = context.lock_poison();
-                let mut ma_device_lock = context_lock.context.lock_poison();
-                ma_device_init(ma_device_lock.as_mut(), &config, inner.device.as_mut())
+                inner.context = Some(Arc::clone(&context));
+                ma_device_init(context.as_mut_ptr(), &devconfig, inner.device.as_mut())
             } else {
-                ma_device_init(std::ptr::null_mut(), &config, inner.device.as_mut())
+                ma_device_init(std::ptr::null_mut(), &devconfig, inner.device.as_mut())
             };
 
             if result != MA_SUCCESS {
-                return Err(AudioDeviceError::InitializationError(result));
+                return Err(DeviceError::InitializationError(result));
             }
 
-            let result = ma_device_start(inner.device.as_mut());
-            if result != MA_SUCCESS {
-                return Err(AudioDeviceError::InitializationError(result));
-            }
-
-            Ok(inner)
+            Ok((inner, sender))
         }
+    }
+
+    pub fn start(&mut self) -> Result<(), DeviceError> {
+        unsafe {
+            let result = ma_device_start(self.device.as_mut());
+            if result != MA_SUCCESS {
+                return Err(DeviceError::InitializationError(result));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<(), DeviceError> {
+        unsafe {
+            let result = ma_device_stop(self.device.as_mut());
+            if result != MA_SUCCESS {
+                return Err(DeviceError::InitializationError(result));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_callback<F>(&mut self, callback: Option<F>) -> Result<(), DeviceError>
+    where
+        F: FnMut(&[f32], &mut [f32]) + Send + 'static,
+    {
+        self.callback =
+            callback.map(|cb| Box::new(cb) as Box<dyn FnMut(&[f32], &mut [f32]) + Send + 'static>);
+        Ok(())
+    }
+
+    pub fn set_input_callback<F>(&mut self, callback: Option<F>) -> Result<(), DeviceError>
+    where
+        F: FnMut(&[f32]) + Send + 'static,
+    {
+        self.input_callback =
+            callback.map(|cb| Box::new(cb) as Box<dyn FnMut(&[f32]) + Send + 'static>);
+        Ok(())
+    }
+
+    pub fn set_output_callback<F>(&mut self, callback: Option<F>) -> Result<(), DeviceError>
+    where
+        F: FnMut(&mut [f32]) + Send + 'static,
+    {
+        self.output_callback =
+            callback.map(|cb| Box::new(cb) as Box<dyn FnMut(&mut [f32]) + Send + 'static>);
+        Ok(())
     }
 
     pub fn process(
         &mut self,
+        input: &[f32],
         output: &mut [f32],
-        frame_count: u64,
-    ) -> Result<(), AudioDeviceError> {
-        utils::array_fast_set_value_f32(output, 0.0);
+    ) -> Result<(), DeviceError> {
+        MathUtils::simd_set(output, 0.0);
+        MathUtils::simd_set(&mut self.buffer1, 0.0);
+        MathUtils::simd_set(&mut self.buffer2, 0.0);
 
-        let mut channels = self.channels.lock_poison();
-        let mut mixers = self.mixers.lock_poison();
+        let target_channel_count = self.device.playback.channels;
 
-        if channels.is_empty() && mixers.is_empty() {
+        while let Ok(handle) = self.receiver.try_recv() {
+            self.handles.push(TrackChannelHandle {
+                channel: handle,
+                removed: false,
+            });
+        }
+
+        if self.handles.is_empty() && self.callback.is_none() {
             return Ok(());
         }
 
-        let required_frame_count = self.resampler.get_required_input(frame_count);
+        let frame_count =
+            crate::macros::frame_count_from!(output.len(), target_channel_count as usize);
 
-        if let Err(e) = required_frame_count {
-            return Err(AudioDeviceError::AudioResamplerError(e));
-        }
-
-        let required_frame_count = required_frame_count.unwrap();
-        let channel_count = self.device.playback.channels as usize;
-
-        utils::array_fast_set_value_f32(&mut self.resampler_buffer, 0.0);
-
-        if self.fx.is_some() {
-            let fx = self.fx.as_mut().unwrap();
-
-            let mut target_frame_count = required_frame_count;
-            let readed_frame_count = required_frame_count;
-
-            if !fx.tempo_bypass() {
-                let required_frame_count = fx.get_required_input(frame_count);
-
-                if let Err(e) = required_frame_count {
-                    return Err(AudioDeviceError::AudioFXError(e));
-                }
-
-                target_frame_count = required_frame_count.unwrap();
+        for handle in self.handles.iter_mut() {
+            if handle.removed {
+                continue;
             }
 
-            utils::array_fast_set_value_f32(&mut self.buffer, 0.0);
-            utils::array_fast_set_value_f32(&mut self.temp_buffer, 0.0);
+            match &handle.channel {
+                AudioHandle::Track(track_weak) => {
+                    if let Some(track_mutex) = track_weak.upgrade() {
+                        match track_mutex.try_lock() {
+                            Ok(mut track) => {
+                                match track.read(
+                                    self.spatialization.as_mut(),
+                                    &mut self.channel_converter,
+                                    &mut self.buffer1,
+                                    &mut self.buffer2,
+                                    frame_count,
+                                ) {
+                                    Ok(pcm_length) => {
+                                        if pcm_length > 0 {
+                                            let size =
+                                                pcm_length as usize * target_channel_count as usize;
+                                            MathUtils::simd_add(
+                                                &mut output[..size],
+                                                &self.buffer1[..size],
+                                            );
+                                        } else {
+                                            handle.removed = true;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("Error reading PCM frames: {}", err);
+                                        handle.removed = true;
+                                    }
+                                }
+                            }
+                            Err(TryLockError::Poisoned(channel)) => {
+                                let ref_id = channel.get_ref().ref_id;
 
-            let mut max_frames_readed = 0;
-            for channel in channels.iter_mut() {
-                if let Some(mut lock) = channel.try_lock_poison() {
-                    let frames_read = lock
-                        .read_pcm_frames(
-                            self.spatialization.as_mut(),
-                            &mut self.buffer,
-                            &mut self.temp_buffer,
-                            target_frame_count,
-                        )
-                        .unwrap_or(0);
-
-                    if frames_read > 0 {
-                        utils::array_fast_add_value_f32(
-                            &self.buffer,
-                            &mut self.resampler_buffer,
-                            (frames_read as usize * channel_count) as usize,
-                        );
-                    }
-
-                    max_frames_readed = max_frames_readed.max(frames_read);
-                }
-            }
-
-            utils::array_fast_set_value_f32(&mut self.buffer, 0.0);
-            utils::array_fast_set_value_f32(&mut self.temp_buffer, 0.0);
-
-            for mixer in mixers.iter_mut() {
-                if let Some(mut lock) = mixer.try_lock_poison() {
-                    let frames_read = lock
-                        .read_pcm_frames(
-                            self.spatialization.as_mut(),
-                            &mut self.buffer,
-                            &mut self.temp_buffer,
-                            target_frame_count,
-                        )
-                        .unwrap_or(0);
-
-                    if frames_read > 0 {
-                        utils::array_fast_add_value_f32(
-                            &self.buffer,
-                            &mut self.resampler_buffer,
-                            (frames_read as usize * channel_count) as usize,
-                        );
-                    }
-
-                    max_frames_readed = max_frames_readed.max(frames_read);
-                }
-            }
-
-            fx.frame_available += max_frames_readed as i64;
-
-            if fx.frame_available > 0 {
-                let readed = fx.process(
-                    &self.resampler_buffer,
-                    target_frame_count,
-                    &mut self.buffer,
-                    readed_frame_count,
-                );
-
-                if let Err(e) = readed {
-                    return Err(AudioDeviceError::AudioFXError(e));
-                }
-
-                fx.frame_available -= readed_frame_count as i64;
-
-                if fx.frame_available < 0 {
-                    fx.frame_available = 0;
-                }
-            }
-
-            utils::array_fast_copy_f32(
-                &self.buffer,
-                &mut self.resampler_buffer,
-                0,
-                0,
-                (required_frame_count as usize * channel_count) as usize,
-            );
-        } else {
-            utils::array_fast_set_value_f32(&mut self.buffer, 0.0);
-            utils::array_fast_set_value_f32(&mut self.temp_buffer, 0.0);
-
-            for channel in channels.iter_mut() {
-                if let Some(mut lock) = channel.try_lock_poison() {
-                    let frames_read = lock
-                        .read_pcm_frames(
-                            self.spatialization.as_mut(),
-                            &mut self.buffer,
-                            &mut self.temp_buffer,
-                            required_frame_count,
-                        )
-                        .unwrap_or(0);
-
-                    if frames_read > 0 {
-                        utils::array_fast_add_value_f32(
-                            &self.buffer,
-                            &mut self.resampler_buffer,
-                            (frames_read as usize * channel_count) as usize,
-                        );
+                                eprintln!("Warning: Audio channel {} is poisoned", ref_id);
+                                handle.removed = true;
+                            }
+                            Err(TryLockError::WouldBlock) => {
+                                continue;
+                            }
+                        }
+                    } else {
+                        handle.removed = true;
                     }
                 }
-            }
+                AudioHandle::Sample(sample_weak) => {
+                    if let Some(sample_mutex) = sample_weak.upgrade() {
+                        match sample_mutex.try_lock() {
+                            Ok(mut sample) => {
+                                match sample.read(
+                                    self.spatialization.as_mut(),
+                                    &mut self.channel_converter,
+                                    &mut self.buffer1,
+                                    &mut self.buffer2,
+                                    frame_count,
+                                ) {
+                                    Ok(pcm_length) => {
+                                        if pcm_length > 0 {
+                                            let size =
+                                                pcm_length as usize * target_channel_count as usize;
+                                            MathUtils::simd_add(
+                                                &mut output[..size],
+                                                &self.buffer1[..size],
+                                            );
+                                        } else {
+                                            handle.removed = true;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("Error reading PCM frames from sample: {}", err);
+                                        handle.removed = true;
+                                    }
+                                }
+                            }
+                            Err(TryLockError::Poisoned(sample)) => {
+                                let ref_id = sample.get_ref().ref_id;
 
-            utils::array_fast_set_value_f32(&mut self.buffer, 0.0);
-            utils::array_fast_set_value_f32(&mut self.temp_buffer, 0.0);
+                                eprintln!("Warning: Sample channel {} is poisoned", ref_id);
+                                handle.removed = true;
+                            }
+                            Err(TryLockError::WouldBlock) => {
+                                continue;
+                            }
+                        }
+                    } else {
+                        handle.removed = true;
+                    }
+                }
+                AudioHandle::Mixer(mixer_weak) => {
+                    if let Some(mixer_mutex) = mixer_weak.upgrade() {
+                        match mixer_mutex.try_lock() {
+                            Ok(mut mixer) => {
+                                match mixer.read(
+                                    self.spatialization.as_mut(),
+                                    &mut self.channel_converter,
+                                    &mut self.buffer1,
+                                    &mut self.buffer2,
+                                    frame_count,
+                                ) {
+                                    Ok(pcm_length) => {
+                                        if pcm_length > 0 {
+                                            let size =
+                                                pcm_length as usize * target_channel_count as usize;
+                                            MathUtils::simd_add(
+                                                &mut output[..size],
+                                                &self.buffer1[..size],
+                                            );
+                                        } else {
+                                            handle.removed = true;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("Error reading PCM frames from mixer: {}", err);
+                                        handle.removed = true;
+                                    }
+                                }
+                            }
+                            Err(TryLockError::Poisoned(mixer)) => {
+                                let ref_id = mixer.get_ref().ref_id;
 
-            for mixer in mixers.iter_mut() {
-                if let Some(mut lock) = mixer.try_lock_poison() {
-                    let frames_read = lock
-                        .read_pcm_frames(
-                            self.spatialization.as_mut(),
-                            &mut self.buffer,
-                            &mut self.temp_buffer,
-                            required_frame_count,
-                        )
-                        .unwrap_or(0);
-
-                    if frames_read > 0 {
-                        utils::array_fast_add_value_f32(
-                            &self.buffer,
-                            &mut self.resampler_buffer,
-                            (frames_read as usize * channel_count) as usize,
-                        );
+                                eprintln!("Warning: Mixer channel {} is poisoned", ref_id);
+                                handle.removed = true;
+                            }
+                            Err(TryLockError::WouldBlock) => {
+                                continue;
+                            }
+                        }
+                    } else {
+                        handle.removed = true;
                     }
                 }
             }
         }
 
-        if !self.resampler.bypass_mode() {
-            self.resampler
-                .process(
-                    &self.resampler_buffer,
-                    required_frame_count,
-                    output,
-                    frame_count,
-                )
-                .map_err(AudioDeviceError::AudioResamplerError)?;
-        } else {
-            utils::array_fast_copy_f32(
-                &self.resampler_buffer,
-                output,
-                0,
-                0,
-                (required_frame_count as usize * channel_count) as usize,
-            );
+        if let Some(callback) = &mut self.callback {
+            callback(input, output);
         }
 
-        self.panner
-            .process(output, &mut self.buffer, frame_count)
-            .map_err(AudioDeviceError::AudioPannerError)?;
-
-        self.volume
-            .process(&self.buffer, output, frame_count)
-            .map_err(AudioDeviceError::AudioVolumeError)?;
-
-        // Apply DSP callback if set
-        if let Some(dsp_callback) = self.dsp_callback.as_ref() {
-            dsp_callback(output, frame_count);
+        if let Some(input_callback) = &mut self.input_callback {
+            input_callback(input);
         }
 
-        // divide by the number of channels and clip
-        let num_of_sources = mixers.len() + channels.len();
-        if num_of_sources > 1 {
-            let output_sz = output.len();
-
-            for i in 0..output_sz {
-                output[i] /= num_of_sources as f32;
-                output[i] = output[i].clamp(-1.0, 1.0);
-            }
+        if let Some(output_callback) = &mut self.output_callback {
+            output_callback(output);
         }
 
-        // Clean up stopped channels
-        channels.retain(|channel| {
-            if let Some(lock) = channel.try_lock_poison() {
-                if lock.marked_as_deleted {
-                    return false;
-                }
-            }
+        let buffer1 = crate::macros::make_slice_mut!(
+            self.buffer1,
+            frame_count,
+            target_channel_count as usize
+        );
 
-            true
-        });
-
-        mixers.retain(|mixer| {
-            if let Some(lock) = mixer.try_lock_poison() {
-                if lock.marked_as_deleted {
-                    return false;
-                }
-            }
-
-            true
-        });
-
-        Ok(())
-    }
-
-    pub fn add_channel(
-        &mut self,
-        channel: Arc<Mutex<AudioChannelInner>>,
-    ) -> Result<(), AudioDeviceError> {
-        let mut channels = self.channels.lock_poison();
-
-        let channel_lock = channel.lock_poison();
-        if channels
-            .iter()
-            .any(|c| c.lock_poison().ref_id == channel_lock.ref_id)
-        {
-            return Err(AudioDeviceError::ChannelAlreadyExists(channel_lock.ref_id));
+        if let Err(e) = self.panner.process(output, buffer1) {
+            eprintln!("Error processing panner: {}", e);
         }
 
-        drop(channel_lock);
-
-        channels.push(channel);
-        Ok(())
-    }
-
-    pub fn remove_channel(&mut self, channel: usize) -> Result<(), AudioDeviceError> {
-        let mut channels = self.channels.lock_poison();
-        if channel < channels.len() {
-            channels.remove(channel);
-            Ok(())
-        } else {
-            Err(AudioDeviceError::ChannelNotFound(channel))
-        }
-    }
-
-    pub fn add_mixer(
-        &mut self,
-        mixer: Arc<Mutex<AudioMixerInner>>,
-    ) -> Result<(), AudioDeviceError> {
-        let mut mixers = self.mixers.lock_poison();
-
-        let mixer_lock = mixer.lock_poison();
-        if mixers
-            .iter()
-            .any(|m| m.lock_poison().ref_id == mixer_lock.ref_id)
-        {
-            return Err(AudioDeviceError::MixerAlreadyExists(mixer_lock.ref_id));
+        if let Err(e) = self.volume.process(buffer1, output) {
+            eprintln!("Error processing volume: {}", e);
         }
 
-        drop(mixer_lock);
+        self.handles.retain(|ch| !ch.removed);
+        MathUtils::simd_clamp(output, -1.0, 1.0);
 
-        mixers.push(mixer);
-        Ok(())
-    }
-
-    pub fn remove_mixer(&mut self, mixer: usize) -> Result<(), AudioDeviceError> {
-        let mut mixers = self.mixers.lock_poison();
-        let mut index_to_remove = None;
-
-        for (i, m) in mixers.iter().enumerate() {
-            let locked = m.lock_poison();
-
-            if locked.ref_id == mixer {
-                index_to_remove = Some(i);
-                break;
-            }
-        }
-
-        if let Some(index) = index_to_remove {
-            mixers.remove(index);
-            Ok(())
-        } else {
-            Err(AudioDeviceError::MixerNotFound(mixer))
-        }
+        return Ok(());
     }
 }
 
@@ -436,22 +419,50 @@ pub(crate) extern "C" fn audio_callback(
                 return;
             }
 
-            let inner = (device.pUserData as *mut AudioDeviceInner)
+            let inner = (device.pUserData as *mut DeviceInner)
                 .as_mut()
                 .unwrap();
 
             let channel_count = device.playback.channels as usize;
 
-            let output = std::slice::from_raw_parts_mut(
-                _pOutput as *mut f32,
-                _frameCount as usize * channel_count,
-            );
+            let empty_input = [0f32; 0];
+            let mut empty_output = [0f32; 0];
 
-            inner
-                .process(output, _frameCount as u64)
-                .unwrap_or_else(|err| {
-                    eprintln!("Error processing audio: {}", err);
-                });
+            let (input, output) = match inner.ty {
+                DeviceType::Playback => {
+                    let output = std::slice::from_raw_parts_mut(
+                        _pOutput as *mut f32,
+                        _frameCount as usize * channel_count,
+                    );
+
+                    (empty_input.as_slice(), output)
+                }
+                DeviceType::Capture => {
+                    let input = std::slice::from_raw_parts(
+                        _pInput as *mut f32,
+                        _frameCount as usize * channel_count,
+                    );
+
+                    (input, empty_output.as_mut_slice())
+                }
+                DeviceType::Duplex => {
+                    let input = std::slice::from_raw_parts(
+                        _pInput as *mut f32,
+                        _frameCount as usize * channel_count,
+                    );
+
+                    let output = std::slice::from_raw_parts_mut(
+                        _pOutput as *mut f32,
+                        _frameCount as usize * channel_count,
+                    );
+
+                    (input, output)
+                }
+            };
+
+            inner.process(input, output).unwrap_or_else(|err| {
+                eprintln!("Error processing audio: {}", err);
+            });
         }
     });
 
@@ -460,13 +471,14 @@ pub(crate) extern "C" fn audio_callback(
     }
 }
 
-impl Drop for AudioDeviceInner {
+impl Drop for DeviceInner {
     fn drop(&mut self) {
+        _ = self.stop();
+
         // SAFETY: This function is safe because it properly uninitializes the audio device and decoders.
         // The code ensures that all resources are released and cleaned up.
         unsafe {
-            self.channels.lock_poison().clear();
-
+            self.handles.clear();
             ma_device_uninit(self.device.as_mut());
         }
     }

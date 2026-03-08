@@ -1,48 +1,30 @@
 use std::ffi::c_void;
 
 use miniaudio_sys::*;
+use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Error)]
 #[must_use]
 pub enum AudioVolumeError {
-    InitializationFailed(i32),        // Holds the error code from miniaudio
-    InvalidChannels(u32),             // Holds the invalid channel count
-    ProcessFailed(i32),               // Holds the error code from processing
+    #[error("Initialization failed with error code: {0}")]
+    InitializationFailed(i32), // Holds the error code from miniaudio
+    #[error("Invalid number of channels: {0}")]
+    InvalidChannels(usize), // Holds the invalid channel count
+    #[error("Processing failed with error code: {0}")]
+    ProcessFailed(i32), // Holds the error code from processing
+    #[error("Buffer size mismatch: expected {0}, got {1}")]
     BufferSizeMismatch(usize, usize), // Holds the expected and actual buffer sizes
-}
-
-impl std::fmt::Display for AudioVolumeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AudioVolumeError::InitializationFailed(code) => {
-                write!(f, "Initialization failed with error code: {}", code)
-            }
-            AudioVolumeError::InvalidChannels(channels) => {
-                write!(f, "Invalid number of channels: {}", channels)
-            }
-            AudioVolumeError::ProcessFailed(code) => {
-                write!(f, "Processing failed with error code: {}", code)
-            }
-            AudioVolumeError::BufferSizeMismatch(expected, actual) => {
-                write!(
-                    f,
-                    "Buffer size mismatch: expected {}, got {}",
-                    expected, actual
-                )
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct AudioVolume {
     pub instance: Box<ma_gainer>,
-    pub channels: u32,
+    pub channels: usize,
     pub volume: f32,
 }
 
 impl AudioVolume {
-    pub fn new(channels: u32) -> Result<Self, AudioVolumeError> {
+    pub fn new(channels: usize) -> Result<Self, AudioVolumeError> {
         if channels < 1 || channels > 8 {
             return Err(AudioVolumeError::InvalidChannels(channels));
         }
@@ -51,12 +33,11 @@ impl AudioVolume {
         // The code ensures that the gainer is properly initialized and can be used for audio operations.
         unsafe {
             let mut gainer = Box::<ma_gainer>::new_uninit();
-            let config = ma_gainer_config_init(channels, 0);
+            let config = ma_gainer_config_init(channels as u32, 0);
 
             let result = ma_gainer_init(&config, std::ptr::null(), gainer.as_mut_ptr());
 
             if result != MA_SUCCESS {
-                // return Err(format!("Failed to initialize gainer: {}", result));
                 return Err(AudioVolumeError::InitializationFailed(result));
             }
 
@@ -84,23 +65,19 @@ impl AudioVolume {
         }
     }
 
-    pub fn process(
-        &mut self,
-        input: &[f32],
-        output: &mut [f32],
-        frame_count: u64,
-    ) -> Result<(), AudioVolumeError> {
-        let expected_array_size = (frame_count * self.channels as u64) as usize;
-        if input.len() < expected_array_size || output.len() < expected_array_size {
-            // return Err(format!(
-            //     "Invalid array size: expected {}, got {}|{}",
-            //     expected_array_size,
-            //     input.len(),
-            //     output.len()
-            // ));
+    pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), AudioVolumeError> {
+        if input.len() != output.len() {
             return Err(AudioVolumeError::BufferSizeMismatch(
-                expected_array_size,
                 input.len(),
+                output.len(),
+            ));
+        }
+
+        let frame_count = input.len() / self.channels as usize;
+        if frame_count == 0 {
+            return Err(AudioVolumeError::BufferSizeMismatch(
+                input.len(),
+                output.len(),
             ));
         }
 
@@ -110,11 +87,10 @@ impl AudioVolume {
                 self.instance.as_mut(),
                 output.as_mut_ptr() as *mut c_void,
                 input.as_ptr() as *mut c_void,
-                frame_count,
+                frame_count as u64,
             );
 
             if result != MA_SUCCESS {
-                // return Err(format!("Failed to process PCM frames: {}", result));
                 return Err(AudioVolumeError::ProcessFailed(result));
             }
         }
